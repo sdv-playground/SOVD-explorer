@@ -29,9 +29,9 @@ rand = "0.9"
 url = "2"
 open = "5"
 
-# SOVD crates from local workspace
-sovd-client = { path = "/home/saka/BALI/SOVDd/crates/sovd-client" }
-sovd-uds = { path = "/home/saka/BALI/SOVDd/crates/sovd-uds", default-features = false }
+# SOVD crates from git
+sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-uds = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main", default-features = false }
 
 [profile.release]
 panic = "abort"

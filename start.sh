@@ -25,6 +25,10 @@ trap cleanup SIGINT SIGTERM EXIT
 
 cd "$SCRIPT_DIR"
 npm install
+
+# Pull latest SOVD crates from master
+(cd src-tauri && cargo update -p sovd-client -p sovd-uds)
+
 npm run tauri dev &
 TAURI_PID=$!
 
