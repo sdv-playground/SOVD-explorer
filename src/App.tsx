@@ -2255,22 +2255,45 @@ interface TransferInfo {
   error: string | null;
 }
 
-type FlashPhase = "idle" | "uploading" | "verifying" | "flashing" | "finalizing" | "resetting" | "activated" | "complete" | "committed" | "rolledback" | "error";
+// --- Flash phase & state constants ---
+// UI phases (internal to Explorer)
+const PHASE = {
+  IDLE: "idle",
+  UPLOADING: "uploading",
+  VERIFYING: "verifying",
+  FLASHING: "flashing",
+  FINALIZING: "finalizing",
+  RESETTING: "resetting",
+  ACTIVATED: "activated",
+  COMPLETE: "complete",
+  COMMITTED: "committed",
+  ROLLED_BACK: "rolledback",
+  ERROR: "error",
+} as const;
+type FlashPhase = (typeof PHASE)[keyof typeof PHASE];
 
-// Canonical flash state strings from sovd-core (snake_case).
-// Normalizes server responses to handle variant casing.
-type FlashStateStr =
-  | "queued" | "preparing" | "transferring" | "awaiting_exit" | "awaiting_reset"
-  | "complete" | "failed" | "activated" | "committed" | "rolled_back";
+// Canonical wire states from sovd-core (snake_case)
+const STATE = {
+  QUEUED: "queued",
+  PREPARING: "preparing",
+  TRANSFERRING: "transferring",
+  AWAITING_EXIT: "awaiting_exit",
+  AWAITING_RESET: "awaiting_reset",
+  COMPLETE: "complete",
+  FAILED: "failed",
+  ACTIVATED: "activated",
+  COMMITTED: "committed",
+  ROLLED_BACK: "rolled_back",
+} as const;
+type FlashStateStr = (typeof STATE)[keyof typeof STATE];
 
 function normalizeFlashState(raw: string): FlashStateStr {
   const s = raw.toLowerCase().replace(/[-\s]/g, "_");
-  // Map compressed/legacy forms to canonical snake_case
-  if (s === "awaitingexit") return "awaiting_exit";
-  if (s === "awaitingreset") return "awaiting_reset";
-  if (s === "rolledback") return "rolled_back";
-  if (s === "completed" || s === "finished") return "complete";
-  if (s === "error" || s === "aborted") return "failed";
+  if (s === "awaitingexit") return STATE.AWAITING_EXIT;
+  if (s === "awaitingreset") return STATE.AWAITING_RESET;
+  if (s === "rolledback") return STATE.ROLLED_BACK;
+  if (s === "completed" || s === "finished") return STATE.COMPLETE;
+  if (s === "error" || s === "aborted") return STATE.FAILED;
   return s as FlashStateStr;
 }
 
@@ -2327,7 +2350,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     }
   };
 
-  const terminalStates = ["failed", "complete", "committed", "rolled_back"];
+  const terminalStates = [STATE.FAILED, STATE.COMPLETE, STATE.COMMITTED, STATE.ROLLED_BACK];
 
   // Check for existing transfers across ALL ECUs
   const checkExistingTransfers = async () => {
@@ -2382,29 +2405,29 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         const state = normalizeFlashState(transfer.state);
 
         // Active transfer states — resume monitoring
-        if (state === "queued" || state === "preparing" || state === "transferring") {
+        if (state === STATE.QUEUED || state === STATE.PREPARING || state === STATE.TRANSFERRING) {
           setTransferId(transfer.transfer_id);
-          setPhase("flashing");
+          setPhase(PHASE.FLASHING);
           addLog(`Resumed: active flash transfer (${transfer.state})`);
           return true;
         }
 
-        if (state === "awaiting_exit") {
+        if (state === STATE.AWAITING_EXIT) {
           setTransferId(transfer.transfer_id);
-          setPhase("finalizing");
+          setPhase(PHASE.FINALIZING);
           addLog("Resumed: transfer complete, awaiting finalization");
           return true;
         }
 
         // Post-finalize states
-        if (state === "awaiting_reset") {
+        if (state === STATE.AWAITING_RESET) {
           setTransferId(transfer.transfer_id);
-          setPhase("resetting");
+          setPhase(PHASE.RESETTING);
           addLog("Resumed: firmware flashed, awaiting ECU reset");
           return true;
         }
 
-        if (state === "activated") {
+        if (state === STATE.ACTIVATED) {
           setTransferId(transfer.transfer_id);
           try {
             const activation = await invoke<ActivationInfo>("flash_get_activation");
@@ -2412,33 +2435,33 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
             if (activation.active_version) setSwVersionAfter(activation.active_version);
             if (activation.previous_version) setSwVersionBefore(activation.previous_version);
           } catch { /* ignore */ }
-          setPhase("activated");
+          setPhase(PHASE.ACTIVATED);
           addLog("Resumed: firmware activated, awaiting commit or rollback");
           // ECU rebooted — refresh parent session/security display
           onUpdateComplete?.();
           return true;
         }
 
-        if (state === "committed") {
+        if (state === STATE.COMMITTED) {
           try {
             const activation = await invoke<ActivationInfo>("flash_get_activation");
             setActivationState(activation);
             if (activation.active_version) setSwVersionAfter(activation.active_version);
             if (activation.previous_version) setSwVersionBefore(activation.previous_version);
           } catch { /* ignore */ }
-          setPhase("committed");
+          setPhase(PHASE.COMMITTED);
           addLog("Firmware was committed successfully");
           onUpdateComplete?.();
           return true;
         }
 
-        if (state === "rolled_back") {
+        if (state === STATE.ROLLED_BACK) {
           try {
             const activation = await invoke<ActivationInfo>("flash_get_activation");
             setActivationState(activation);
             if (activation.previous_version) setSwVersionBefore(activation.previous_version);
           } catch { /* ignore */ }
-          setPhase("rolledback");
+          setPhase(PHASE.ROLLED_BACK);
           addLog("Firmware was rolled back to previous version");
           onUpdateComplete?.();
           return true;
@@ -2452,16 +2475,16 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         const aState = normalizeFlashState(activation.state);
 
         if (aState === "awaiting_reset") {
-          setPhase("resetting");
+          setPhase(PHASE.RESETTING);
           addLog("Resumed: awaiting ECU reset");
           return true;
         }
 
-        if (aState === "activated") {
+        if (aState === STATE.ACTIVATED) {
           setActivationState(activation);
           if (activation.active_version) setSwVersionAfter(activation.active_version);
           if (activation.previous_version) setSwVersionBefore(activation.previous_version);
-          setPhase("activated");
+          setPhase(PHASE.ACTIVATED);
           addLog("Resumed: firmware activated, awaiting commit or rollback");
           onUpdateComplete?.();
           return true;
@@ -2478,7 +2501,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
 
   useEffect(() => {
     // Reset state when switching ECUs
-    setPhase("idle");
+    setPhase(PHASE.IDLE);
     setProgress(0);
     setError(null);
     setSelectedFile(null);
@@ -2583,7 +2606,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
   };
 
   const resetState = () => {
-    setPhase("idle");
+    setPhase(PHASE.IDLE);
     setProgress(0);
     setError(null);
     setSelectedFile(null);
@@ -2663,7 +2686,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       }
 
       // Phase 1: Upload
-      setPhase("uploading");
+      setPhase(PHASE.UPLOADING);
       setProgress(0);
       addLog(`Uploading ${selectedFile.name}...`);
 
@@ -2694,7 +2717,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       addLog(`Upload complete (File ID: ${uploadedFileId})`)
 
       // Phase 2: Verify
-      setPhase("verifying");
+      setPhase(PHASE.VERIFYING);
       setProgress(0);
       addLog("Verifying package integrity...");
 
@@ -2707,7 +2730,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       await invoke("set_session", { componentId: apiComponentId, session: "programming", target: modeTarget });
 
       // Phase 3: Flash
-      setPhase("flashing");
+      setPhase(PHASE.FLASHING);
       setProgress(0);
       addLog("Starting flash transfer to ECU...");
 
@@ -2736,7 +2759,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         }
 
         const ns = normalizeFlashState(status.state);
-        if (ns === "complete" || ns === "awaiting_exit") {
+        if (ns === STATE.COMPLETE || ns === STATE.AWAITING_EXIT) {
           flashComplete = true;
           addLog("Flash transfer complete");
         } else if (ns === "failed") {
@@ -2745,7 +2768,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       }
 
       // Phase 4: Finalize
-      setPhase("finalizing");
+      setPhase(PHASE.FINALIZING);
       setProgress(0);
       addLog("Finalizing transfer...");
 
@@ -2762,11 +2785,11 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
             transferId: flashResult.transfer_id,
           });
           const ns2 = normalizeFlashState(status.state);
-          if (ns2 === "awaiting_reset") {
+          if (ns2 === STATE.AWAITING_RESET) {
             needsReset = true;
             break;
           }
-          if (ns2 === "complete") {
+          if (ns2 === STATE.COMPLETE) {
             break;
           }
         } catch {
@@ -2778,7 +2801,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
 
       if (needsReset) {
         // ECU needs a reset — stop here and let the user decide
-        setPhase("resetting");
+        setPhase(PHASE.RESETTING);
         addLog("Awaiting ECU reset. Click 'Reset ECU' or power-cycle the ECU externally.");
       } else {
         // No reset needed — read version and complete
@@ -2788,14 +2811,14 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           addLog(`New SW version: ${versionAfter}`);
         }
         markTransferCompleted();
-        setPhase("complete");
+        setPhase(PHASE.COMPLETE);
         setProgress(100);
         addLog("Software update completed successfully!");
         onUpdateComplete?.();
       }
 
     } catch (e) {
-      setPhase("error");
+      setPhase(PHASE.ERROR);
       setError(String(e));
       addLog(`ERROR: ${e}`);
     } finally {
@@ -2815,8 +2838,8 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         await new Promise((r) => setTimeout(r, 500));
         const status = await invoke<FlashResult>("flash_poll_progress", { transferId });
         const fState = normalizeFlashState(status.state);
-        if (fState === "awaiting_reset") {
-          setPhase("resetting");
+        if (fState === STATE.AWAITING_RESET) {
+          setPhase(PHASE.RESETTING);
           addLog("Awaiting ECU reset. Click 'Reset ECU' or power-cycle the ECU externally.");
         } else {
           const versionAfter = await readSwVersion();
@@ -2825,14 +2848,14 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
             addLog(`New SW version: ${versionAfter}`);
           }
           markTransferCompleted();
-          setPhase("complete");
+          setPhase(PHASE.COMPLETE);
           setProgress(100);
           addLog("Software update completed successfully!");
           onUpdateComplete?.();
         }
       }
     } catch (e) {
-      setPhase("error");
+      setPhase(PHASE.ERROR);
       setError(String(e));
       addLog(`ERROR: Finalize failed: ${e}`);
     }
@@ -2866,7 +2889,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
   // state. The ECU may be rebooting (unreachable) or still in AwaitingReset.
   // Only transition once the ECU reports a state other than AwaitingReset.
   useEffect(() => {
-    if (phase !== "resetting") return;
+    if (phase !== PHASE.RESETTING) return;
 
     let active = true;
     let wasOffline = false;
@@ -2886,7 +2909,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         }
 
         const rState = normalizeFlashState(activation.state);
-        if (rState === "awaiting_reset") {
+        if (rState === STATE.AWAITING_RESET) {
           // Still waiting — keep polling silently
           return;
         }
@@ -2908,11 +2931,11 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         }
 
         if (activation.supports_rollback) {
-          setPhase("activated");
+          setPhase(PHASE.ACTIVATED);
           addLog("Firmware activated. Commit to make permanent, or Rollback to revert.");
         } else {
           markTransferCompleted();
-          setPhase("complete");
+          setPhase(PHASE.COMPLETE);
           setProgress(100);
           addLog("Software update completed successfully!");
           onUpdateComplete?.();
@@ -2940,7 +2963,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
 
   // Poll flash progress when hydrated into "flashing" phase (not driven by startFlashProcess)
   useEffect(() => {
-    if (phase !== "flashing" || !transferId || imperativeFlashRef.current) return;
+    if (phase !== PHASE.FLASHING || !transferId || imperativeFlashRef.current) return;
 
     let active = true;
 
@@ -2957,16 +2980,16 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
 
         const pState = normalizeFlashState(status.state);
 
-        if (pState === "complete" || pState === "awaiting_exit") {
+        if (pState === STATE.COMPLETE || pState === STATE.AWAITING_EXIT) {
           active = false;
           addLog("Flash transfer complete");
-          setPhase("finalizing");
+          setPhase(PHASE.FINALIZING);
           return;
         }
 
-        if (pState === "failed") {
+        if (pState === STATE.FAILED) {
           active = false;
-          setPhase("error");
+          setPhase(PHASE.ERROR);
           setError(status.error || "Flash transfer failed");
           addLog(`ERROR: ${status.error || "Flash transfer failed"}`);
           return;
@@ -2991,14 +3014,14 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       const result = await invoke<CommitRollbackResult>("flash_commit");
       if (result.success) {
         markTransferCompleted();
-        setPhase("committed");
+        setPhase(PHASE.COMMITTED);
         addLog("Firmware committed successfully — update is permanent.");
         onUpdateComplete?.();
       } else {
         throw new Error(result.message || "Commit failed");
       }
     } catch (e) {
-      setPhase("error");
+      setPhase(PHASE.ERROR);
       setError(String(e));
       addLog(`ERROR: Commit failed: ${e}`);
     }
@@ -3010,14 +3033,14 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       const result = await invoke<CommitRollbackResult>("flash_rollback");
       if (result.success) {
         markTransferCompleted();
-        setPhase("rolledback");
+        setPhase(PHASE.ROLLED_BACK);
         addLog("Firmware rolled back — reverted to previous version.");
         onUpdateComplete?.();
       } else {
         throw new Error(result.message || "Rollback failed");
       }
     } catch (e) {
-      setPhase("error");
+      setPhase(PHASE.ERROR);
       setError(String(e));
       addLog(`ERROR: Rollback failed: ${e}`);
     }
@@ -3029,21 +3052,21 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     { key: "flashing", label: "Flash" },
     { key: "finalizing", label: "Finalize" },
     { key: "resetting", label: "Reset" },
-    { key: "activated", label: "Activate" },
-    { key: "complete", label: "Done" },
+    { key: PHASE.ACTIVATED, label: "Activate" },
+    { key: PHASE.COMPLETE, label: "Done" },
   ];
 
   const getPhaseIndex = (p: FlashPhase): number => {
     // committed and rolledback are terminal states that map to the "Done" step
-    if (p === "committed" || p === "rolledback") {
-      return phases.findIndex((x) => x.key === "complete");
+    if (p === PHASE.COMMITTED || p === PHASE.ROLLED_BACK) {
+      return phases.findIndex((x) => x.key === PHASE.COMPLETE);
     }
     const idx = phases.findIndex((x) => x.key === p);
     return idx >= 0 ? idx : -1;
   };
 
   const currentPhaseIndex = getPhaseIndex(phase);
-  const isProcessing = phase !== "idle" && phase !== "complete" && phase !== "error" && phase !== "resetting" && phase !== "activated" && phase !== "committed" && phase !== "rolledback";
+  const isProcessing = phase !== PHASE.IDLE && phase !== PHASE.COMPLETE && phase !== PHASE.ERROR && phase !== PHASE.RESETTING && phase !== PHASE.ACTIVATED && phase !== PHASE.COMMITTED && phase !== PHASE.ROLLED_BACK;
 
   return (
     <div className="software-tab">
@@ -3071,7 +3094,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
             className={`phase-step ${
               idx < currentPhaseIndex ? "completed" :
               idx === currentPhaseIndex ? "active" : ""
-            } ${phase === "error" && idx === currentPhaseIndex ? "error" : ""}`}
+            } ${phase === PHASE.ERROR && idx === currentPhaseIndex ? "error" : ""}`}
           >
             <div className="phase-number">
               {idx < currentPhaseIndex ? "✓" : idx + 1}
@@ -3092,7 +3115,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       )}
 
       {/* Existing Transfers Warning */}
-      {phase === "idle" && existingTransfers.length > 0 && (
+      {phase === PHASE.IDLE && existingTransfers.length > 0 && (
         <div className="transfers-warning">
           <div className="warning-header">Existing transfers found:</div>
           {existingTransfers.map((t) => (
@@ -3116,7 +3139,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       )}
 
       {/* Drop Zone */}
-      {phase === "idle" && (
+      {phase === PHASE.IDLE && (
         <div
           className={`drop-zone ${isDragging ? "dragging" : ""} ${selectedFile ? "has-file" : ""}`}
           onDragOver={handleDragOver}
@@ -3147,7 +3170,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       )}
 
       {/* Awaiting Reset — shown when ECU needs a reset after flashing */}
-      {phase === "resetting" && (
+      {phase === PHASE.RESETTING && (
         <div className="awaiting-reset-info">
           <div className="awaiting-reset-header">Awaiting ECU Reset</div>
           <div className="awaiting-reset-hint">
@@ -3158,7 +3181,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       )}
 
       {/* Activation Info — shown when firmware is activated but not committed */}
-      {phase === "activated" && activationState && (
+      {phase === PHASE.ACTIVATED && activationState && (
         <div className="activation-info">
           <div className="activation-header">Firmware Activated — Awaiting Decision</div>
           <div className="activation-versions">
@@ -3183,7 +3206,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
 
       {/* Action Buttons */}
       <div className="flash-actions">
-        {phase === "idle" && (
+        {phase === PHASE.IDLE && (
           <button
             className="flash-btn start"
             onClick={startFlashProcess}
@@ -3199,19 +3222,19 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           </button>
         )}
 
-        {phase === "finalizing" && !imperativeFlashRef.current && (
+        {phase === PHASE.FINALIZING && !imperativeFlashRef.current && (
           <button className="flash-btn start" onClick={handleFinalize}>
             Finalize Transfer
           </button>
         )}
 
-        {phase === "resetting" && (
+        {phase === PHASE.RESETTING && (
           <button className="flash-btn start" onClick={handleResetEcu}>
             Reset ECU
           </button>
         )}
 
-        {phase === "activated" && (
+        {phase === PHASE.ACTIVATED && (
           <>
             <button className="flash-btn commit" onClick={handleCommit}>
               Commit
@@ -3222,7 +3245,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           </>
         )}
 
-        {(phase === "complete" || phase === "error" || phase === "committed" || phase === "rolledback") && (
+        {(phase === PHASE.COMPLETE || phase === PHASE.ERROR || phase === PHASE.COMMITTED || phase === PHASE.ROLLED_BACK) && (
           <button className="flash-btn reset" onClick={resetState}>
             New Update
           </button>
@@ -3237,7 +3260,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       )}
 
       {/* Success Display */}
-      {phase === "complete" && (
+      {phase === PHASE.COMPLETE && (
         <div className="flash-success">
           <div>Software update completed successfully!</div>
           {(swVersionBefore || swVersionAfter) && (
@@ -3251,7 +3274,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       )}
 
       {/* Committed Display */}
-      {phase === "committed" && (
+      {phase === PHASE.COMMITTED && (
         <div className="flash-success committed">
           <div>Firmware committed — update is permanent.</div>
           {(swVersionBefore || swVersionAfter) && (
@@ -3265,7 +3288,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       )}
 
       {/* Rolledback Display */}
-      {phase === "rolledback" && (
+      {phase === PHASE.ROLLED_BACK && (
         <div className="flash-success rolledback">
           <div>Firmware rolled back — reverted to previous version.</div>
           {activationState?.previous_version && (
