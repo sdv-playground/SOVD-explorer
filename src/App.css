@@ -1939,6 +1939,27 @@ tr.security-required {
    Security Helper (top-level connection bar)
    ============================================================================= */
 
+.reload-btn {
+  background: transparent;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 1.2rem;
+  padding: 0.15rem 0.45rem;
+  transition: all 0.2s;
+  line-height: 1;
+}
+
+.reload-btn:hover {
+  color: #4ade80;
+  border-color: #4ade80;
+}
+
+.reload-btn:active {
+  transform: rotate(180deg);
+}
+
 .settings-toggle {
   background: transparent;
   border: 1px solid #0f3460;

@@ -529,6 +529,9 @@ function App() {
         <header className="header">
           <h1>SOVD Explorer</h1>
           <div className="connection-status">
+            <button className="reload-btn" onClick={checkConnection} title="Reconnect & reload">
+              ↻
+            </button>
             <button className="settings-toggle" onClick={toggleSettings} title="Settings">
               ⚙
             </button>
