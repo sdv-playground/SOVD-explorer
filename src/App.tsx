@@ -2257,6 +2257,23 @@ interface TransferInfo {
 
 type FlashPhase = "idle" | "uploading" | "verifying" | "flashing" | "finalizing" | "resetting" | "activated" | "complete" | "committed" | "rolledback" | "error";
 
+// Canonical flash state strings from sovd-core (snake_case).
+// Normalizes server responses to handle variant casing.
+type FlashStateStr =
+  | "queued" | "preparing" | "transferring" | "awaiting_exit" | "awaiting_reset"
+  | "complete" | "failed" | "activated" | "committed" | "rolled_back";
+
+function normalizeFlashState(raw: string): FlashStateStr {
+  const s = raw.toLowerCase().replace(/[-\s]/g, "_");
+  // Map compressed/legacy forms to canonical snake_case
+  if (s === "awaitingexit") return "awaiting_exit";
+  if (s === "awaitingreset") return "awaiting_reset";
+  if (s === "rolledback") return "rolled_back";
+  if (s === "completed" || s === "finished") return "complete";
+  if (s === "error" || s === "aborted") return "failed";
+  return s as FlashStateStr;
+}
+
 interface ActivationInfo {
   supports_rollback: boolean;
   state: string;
@@ -2310,7 +2327,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     }
   };
 
-  const terminalStates = ["failed", "error", "aborted", "complete", "finished"];
+  const terminalStates = ["failed", "complete", "committed", "rolled_back"];
 
   // Check for existing transfers across ALL ECUs
   const checkExistingTransfers = async () => {
@@ -2322,7 +2339,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         await invoke("flash_init", { componentId: compId });
         const transfers = await invoke<TransferInfo[]>("flash_list_transfers");
         for (const t of transfers) {
-          if (terminalStates.includes(t.state)) continue;
+          if (terminalStates.includes(normalizeFlashState(t.state))) continue;
           if (completedTransferIds.current.has(t.transfer_id)) continue;
           allActive.push({ ...t, component_id: compId });
         }
@@ -2362,17 +2379,17 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
 
       if (transfers.length > 0) {
         const transfer = transfers[0];
-        const state = transfer.state.toLowerCase().replace(/_/g, "");
+        const state = normalizeFlashState(transfer.state);
 
         // Active transfer states — resume monitoring
-        if (["queued", "preparing", "transferring"].includes(state)) {
+        if (state === "queued" || state === "preparing" || state === "transferring") {
           setTransferId(transfer.transfer_id);
           setPhase("flashing");
           addLog(`Resumed: active flash transfer (${transfer.state})`);
           return true;
         }
 
-        if (state === "awaitingexit") {
+        if (state === "awaiting_exit") {
           setTransferId(transfer.transfer_id);
           setPhase("finalizing");
           addLog("Resumed: transfer complete, awaiting finalization");
@@ -2380,7 +2397,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         }
 
         // Post-finalize states
-        if (state === "awaitingreset") {
+        if (state === "awaiting_reset") {
           setTransferId(transfer.transfer_id);
           setPhase("resetting");
           addLog("Resumed: firmware flashed, awaiting ECU reset");
@@ -2415,7 +2432,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           return true;
         }
 
-        if (state === "rolledback") {
+        if (state === "rolled_back") {
           try {
             const activation = await invoke<ActivationInfo>("flash_get_activation");
             setActivationState(activation);
@@ -2432,15 +2449,15 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       // (handles case where transfer record is gone but activation persists)
       try {
         const activation = await invoke<ActivationInfo>("flash_get_activation");
-        const state = activation.state.toLowerCase().replace(/_/g, "");
+        const aState = normalizeFlashState(activation.state);
 
-        if (state === "awaitingreset") {
+        if (aState === "awaiting_reset") {
           setPhase("resetting");
           addLog("Resumed: awaiting ECU reset");
           return true;
         }
 
-        if (state === "activated") {
+        if (aState === "activated") {
           setActivationState(activation);
           if (activation.active_version) setSwVersionAfter(activation.active_version);
           if (activation.previous_version) setSwVersionBefore(activation.previous_version);
@@ -2718,10 +2735,11 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           addLog(`Flashing: ${status.blocks_transferred}/${status.blocks_total} blocks (${percent.toFixed(1)}%)`);
         }
 
-        if (status.state === "finished" || status.state === "awaitingexit" || status.state === "completed" || status.state === "complete") {
+        const ns = normalizeFlashState(status.state);
+        if (ns === "complete" || ns === "awaiting_exit") {
           flashComplete = true;
           addLog("Flash transfer complete");
-        } else if (status.state === "failed" || status.state === "error" || status.state === "aborted") {
+        } else if (ns === "failed") {
           throw new Error(`Flash failed: ${status.error || "Unknown error"}`);
         }
       }
@@ -2743,11 +2761,12 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           const status = await invoke<FlashResult>("flash_poll_progress", {
             transferId: flashResult.transfer_id,
           });
-          if (status.state === "awaiting_reset" || status.state === "awaitingreset") {
+          const ns2 = normalizeFlashState(status.state);
+          if (ns2 === "awaiting_reset") {
             needsReset = true;
             break;
           }
-          if (status.state === "complete" || status.state === "completed" || status.state === "finished") {
+          if (ns2 === "complete") {
             break;
           }
         } catch {
@@ -2795,8 +2814,8 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       if (transferId) {
         await new Promise((r) => setTimeout(r, 500));
         const status = await invoke<FlashResult>("flash_poll_progress", { transferId });
-        const state = status.state.toLowerCase().replace(/_/g, "");
-        if (state === "awaitingreset") {
+        const fState = normalizeFlashState(status.state);
+        if (fState === "awaiting_reset") {
           setPhase("resetting");
           addLog("Awaiting ECU reset. Click 'Reset ECU' or power-cycle the ECU externally.");
         } else {
@@ -2866,8 +2885,8 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           wasOffline = false;
         }
 
-        const state = activation.state.toLowerCase().replace(/_/g, "");
-        if (state === "awaitingreset") {
+        const rState = normalizeFlashState(activation.state);
+        if (rState === "awaiting_reset") {
           // Still waiting — keep polling silently
           return;
         }
@@ -2936,16 +2955,16 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           (status.blocks_total > 0 ? (status.blocks_transferred / status.blocks_total) * 100 : 0);
         setProgress(percent);
 
-        const state = status.state.toLowerCase().replace(/_/g, "");
+        const pState = normalizeFlashState(status.state);
 
-        if (state === "finished" || state === "awaitingexit" || state === "completed" || state === "complete") {
+        if (pState === "complete" || pState === "awaiting_exit") {
           active = false;
           addLog("Flash transfer complete");
           setPhase("finalizing");
           return;
         }
 
-        if (state === "failed" || state === "error" || state === "aborted") {
+        if (pState === "failed") {
           active = false;
           setPhase("error");
           setError(status.error || "Flash transfer failed");
