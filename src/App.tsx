@@ -2350,7 +2350,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     }
   };
 
-  const terminalStates = [STATE.FAILED, STATE.COMPLETE, STATE.COMMITTED, STATE.ROLLED_BACK];
+  const terminalStates: FlashStateStr[] = [STATE.FAILED, STATE.COMPLETE, STATE.COMMITTED, STATE.ROLLED_BACK];
 
   // Check for existing transfers across ALL ECUs
   const checkExistingTransfers = async () => {
