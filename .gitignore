@@ -5,6 +5,7 @@ node_modules/
 dist/
 target/
 tsconfig.tsbuildinfo
+Cargo.lock
 
 # IDE
 .idea/
