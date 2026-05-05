@@ -942,7 +942,7 @@ async fn flash_start(
         .ok_or_else(|| "Flash client not initialized".to_string())?;
 
     let response = flash_client
-        .start_flash(&file_id)
+        .start_flash()
         .await
         .map_err(|e| format!("Failed to start flash: {}", e))?;
 

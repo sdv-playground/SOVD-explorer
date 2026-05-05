@@ -29,6 +29,9 @@ npm install
 # Pull latest SOVD crates from master
 (cd src-tauri && cargo update -p sovd-client -p sovd-uds)
 
+# Keep @tauri-apps/api in sync with the Rust tauri crate version
+npm update @tauri-apps/api @tauri-apps/cli
+
 npm run tauri dev &
 TAURI_PID=$!
 
