@@ -656,12 +656,12 @@ async fn get_security(
         .await
         .map_err(|e| format!("Failed to get security: {}", e))?;
 
-    let seed_str = mode.seed.as_ref().and_then(|s| {
-        s.as_object()
-            .and_then(|o| o.get("Request_Seed"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    // Spec shape (ISO 17978-3): seed is a concatenated lowercase
+    // hex string directly on the mode object, e.g. "aabbccdd".
+    let seed_str = mode
+        .seed
+        .as_ref()
+        .and_then(|s| s.as_str().map(|s| s.to_string()));
 
     Ok(SecurityInfo {
         id: mode.id,

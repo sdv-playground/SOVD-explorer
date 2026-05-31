@@ -73,17 +73,28 @@ interface DataResponse {
   raw?: string;
   length?: number;
   converted?: boolean;
-  timestamp?: number;
+  timestamp?: string;
 }
 
 interface FaultInfo {
   id: string;
   code: string;
-  message: string;
-  severity: string;
+  fault_name: string;
+  severity: number;
   category?: string;
   active: boolean;
   href: string;
+}
+
+// ISO 17978-3 §7.8 severity 1..4 → label/CSS-class token.
+const SEVERITY_LABELS: Record<number, string> = {
+  1: "fatal",
+  2: "error",
+  3: "warn",
+  4: "info",
+};
+function severityLabel(s: number): string {
+  return SEVERITY_LABELS[s] ?? "?";
 }
 
 interface OperationInfo {
@@ -101,7 +112,7 @@ interface OperationResponse {
   status: string;
   result_data?: string;
   error?: string;
-  timestamp: number;
+  timestamp: string;
 }
 
 interface SessionInfo {
@@ -1629,9 +1640,11 @@ function FaultsTab({ faults, loading }: FaultsTabProps) {
         {faults.map((fault) => (
           <tr key={fault.id} className={fault.active ? "fault-active" : ""}>
             <td className="dtc-cell">{fault.code || fault.id}</td>
-            <td>{fault.message || "-"}</td>
+            <td>{fault.fault_name || "-"}</td>
             <td>{fault.category || "-"}</td>
-            <td className={`severity-${fault.severity}`}>{fault.severity || "-"}</td>
+            <td className={`severity-${severityLabel(fault.severity)}`}>
+              {severityLabel(fault.severity)}
+            </td>
             <td>
               {fault.active ? (
                 <span className="status-tag active">Active</span>
