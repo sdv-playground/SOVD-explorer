@@ -77,13 +77,28 @@ interface DataResponse {
 }
 
 interface FaultInfo {
-  id: string;
+  // Spec §7.8 Table 61: no `id` / `category` / `active` extras.
+  // Active is derived from `status.testFailed`; id segment lives
+  // in `href` (everything after the last "/").
   code: string;
   fault_name: string;
   severity: number;
-  category?: string;
-  active: boolean;
+  scope?: string;
+  display_code?: string;
+  symptom?: string;
+  fault_translation_id?: string;
+  symptom_translation_id?: string;
+  status?: { testFailed?: boolean; confirmedDTC?: boolean; [k: string]: unknown };
   href: string;
+}
+
+function faultIsActive(fault: FaultInfo): boolean {
+  return Boolean(fault.status?.testFailed);
+}
+
+function faultId(fault: FaultInfo): string {
+  const parts = fault.href.split("/");
+  return parts[parts.length - 1] || fault.code;
 }
 
 // ISO 17978-3 §7.8 severity 1..4 → label/CSS-class token.
@@ -1639,15 +1654,15 @@ function FaultsTab({ faults, loading }: FaultsTabProps) {
       </thead>
       <tbody>
         {faults.map((fault) => (
-          <tr key={fault.id} className={fault.active ? "fault-active" : ""}>
-            <td className="dtc-cell">{fault.code || fault.id}</td>
+          <tr key={faultId(fault)} className={faultIsActive(fault) ? "fault-active" : ""}>
+            <td className="dtc-cell">{fault.code || faultId(fault)}</td>
             <td>{fault.fault_name || "-"}</td>
-            <td>{fault.category || "-"}</td>
+            <td>{fault.scope || "-"}</td>
             <td className={`severity-${severityLabel(fault.severity)}`}>
               {severityLabel(fault.severity)}
             </td>
             <td>
-              {fault.active ? (
+              {faultIsActive(fault) ? (
                 <span className="status-tag active">Active</span>
               ) : (
                 <span className="status-tag inactive">Inactive</span>
