@@ -1046,7 +1046,9 @@ function ComponentDetails({ componentId, gatewayComponentId, pathPrefix, ensureH
     try {
       let faultList = await invoke<FaultInfo[]>("list_faults", { componentId: apiComponentId });
       if (paramPrefix) {
-        faultList = faultList.filter(f => f.id.startsWith(paramPrefix));
+        // Post-F.6: FaultInfo lost its `id` field — derive the id from the
+        // `href` tail (or fall back to `code`) via the faultId helper.
+        faultList = faultList.filter(f => faultId(f).startsWith(paramPrefix));
       }
       setFaults(faultList);
     } catch (e) {
@@ -1720,14 +1722,18 @@ function OperationsTab({ componentId, session, security, paramPrefix }: Operatio
       });
       setResults(new Map(results.set(opId, response)));
     } catch (e) {
+      // Synthesise an OperationExecution-shaped error placeholder.
+      // The Map is typed against the spec shape (post-F.7) so the
+      // synthetic object can't carry extra `action` / `timestamp`
+      // fields; encode the action into the `error` message instead.
       setResults(
         new Map(
           results.set(opId, {
+            execution_id: "",
             operation_id: opId,
-            action,
-            status: "error",
-            error: String(e),
-            timestamp: Date.now(),
+            status: "failed",
+            error: `${action}: ${String(e)}`,
+            started_at: new Date().toISOString(),
           })
         )
       );
