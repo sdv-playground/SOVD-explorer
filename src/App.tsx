@@ -106,13 +106,14 @@ interface OperationInfo {
   href: string;
 }
 
-interface OperationResponse {
+interface OperationExecution {
+  execution_id: string;
   operation_id: string;
-  action: string;
   status: string;
-  result_data?: string;
+  result?: unknown;
   error?: string;
-  timestamp: string;
+  started_at: string;
+  completed_at?: string;
 }
 
 interface SessionInfo {
@@ -1674,7 +1675,7 @@ function OperationsTab({ componentId, session, security, paramPrefix }: Operatio
   const [operations, setOperations] = useState<OperationInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [executingOp, setExecutingOp] = useState<string | null>(null);
-  const [results, setResults] = useState<Map<string, OperationResponse>>(new Map());
+  const [results, setResults] = useState<Map<string, OperationExecution>>(new Map());
 
   const fetchOperations = useCallback(async () => {
     setLoading(true);
@@ -1697,7 +1698,7 @@ function OperationsTab({ componentId, session, security, paramPrefix }: Operatio
   const executeOperation = async (opId: string, action: "start" | "stop" | "result") => {
     setExecutingOp(opId);
     try {
-      const response = await invoke<OperationResponse>("execute_operation", {
+      const response = await invoke<OperationExecution>("execute_operation", {
         componentId,
         operationId: opId,
         action,
@@ -1727,10 +1728,12 @@ function OperationsTab({ componentId, session, security, paramPrefix }: Operatio
     return <p className="no-data">No operations available</p>;
   }
 
-  const formatResult = (result: OperationResponse | undefined): string => {
+  const formatResult = (result: OperationExecution | undefined): string => {
     if (!result) return "-";
     if (result.error) return `Error: ${result.error}`;
-    if (result.result_data) return result.result_data;
+    if (result.result !== undefined && result.result !== null) {
+      return JSON.stringify(result.result);
+    }
     return result.status;
   };
 

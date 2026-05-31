@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sovd_uds::uds::standard_did;
 use sovd_client::{
-    AppInfo, Component, DataResponse, FaultInfo, OperationInfo, OperationResponse,
+    AppInfo, Component, DataResponse, FaultInfo, OperationExecution, OperationInfo,
     ParameterInfo, SecurityLevel, SovdClient,
     FlashClient,
 };
@@ -580,11 +580,15 @@ async fn execute_operation(
     state: State<'_, AppState>,
     component_id: String,
     operation_id: String,
-    action: String,
-) -> Result<OperationResponse, String> {
+    // Kept on the Tauri surface for the JS caller — the spec-conforming
+    // wire only models "start", but UDS RoutineControl semantics live
+    // in `action`.  Stop / result polling go through separate commands
+    // when needed (not wired yet).
+    _action: String,
+) -> Result<OperationExecution, String> {
     let client = get_client(&state)?;
     client
-        .execute_operation(&component_id, &operation_id, &action, None)
+        .start_operation_execution(&component_id, &operation_id, None)
         .await
         .map_err(|e| format!("Failed to execute operation: {}", e))
 }
