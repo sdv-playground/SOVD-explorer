@@ -1,12 +1,11 @@
 use serde::{Deserialize, Serialize};
-use sovd_uds::uds::standard_did;
 use sovd_client::{
-    AppInfo, Component, DataResponse, FaultInfo, OperationExecution, OperationInfo,
+    AppInfo, Component, DataResponse, FaultInfo, FlashClient, OperationExecution, OperationInfo,
     ParameterInfo, SecurityLevel, SovdClient,
-    FlashClient,
 };
-use std::sync::Mutex;
+use sovd_uds::uds::standard_did;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tauri::State;
 
 // =============================================================================
@@ -18,6 +17,9 @@ struct AppState {
     server_url: Mutex<String>,
     flash_client: Mutex<Option<FlashClient>>,
     current_flash_component: Mutex<Option<String>>,
+    /// Gateway id for the in-flight flash, if the target is a sub-entity.
+    /// Used to route identData (F189) version reads through the gateway.
+    current_flash_gateway: Mutex<Option<String>>,
     helper_url: Mutex<Option<String>>,
     helper_token: Mutex<Option<String>>,
     http_client: reqwest::Client,
@@ -30,6 +32,7 @@ impl Default for AppState {
             server_url: Mutex::new("http://localhost:4000".to_string()),
             flash_client: Mutex::new(None),
             current_flash_component: Mutex::new(None),
+            current_flash_gateway: Mutex::new(None),
             helper_url: Mutex::new(None),
             helper_token: Mutex::new(None),
             http_client: reqwest::Client::new(),
@@ -76,7 +79,10 @@ pub struct SecurityInfo {
 // =============================================================================
 
 #[tauri::command]
-async fn connect(state: State<'_, AppState>, server_url: String) -> Result<ConnectionStatus, String> {
+async fn connect(
+    state: State<'_, AppState>,
+    server_url: String,
+) -> Result<ConnectionStatus, String> {
     match SovdClient::new(&server_url) {
         Ok(client) => {
             // Test the connection with a health check
@@ -278,7 +284,9 @@ async fn get_ecu_info(
     for &(did, key, _label) in standard_did::IDENTIFICATION_DIDS {
         let did_str = format!("F{:03X}", did & 0xFFF);
         let result = if let Some(ref path) = prefix {
-            client.read_sub_entity_data(&component_id, path, &did_str).await
+            client
+                .read_sub_entity_data(&component_id, path, &did_str)
+                .await
         } else {
             client.read_data(&component_id, &did_str).await
         };
@@ -313,7 +321,9 @@ async fn get_ecu_info(
     for (key, param) in &named_params {
         if !info.contains_key(*key) {
             let result = if let Some(ref path) = prefix {
-                client.read_sub_entity_data(&component_id, path, param).await
+                client
+                    .read_sub_entity_data(&component_id, path, param)
+                    .await
             } else {
                 client.read_data(&component_id, param).await
             };
@@ -375,25 +385,43 @@ async fn list_io_controls(
     let mut controls = Vec::new();
     for o in &outputs {
         let detail = client.get_output(&component_id, &o.id).await.ok();
-        let (name, current_state, value, default_value, allowed, controlled_by_tester, frozen, requires_security, security_level) =
-            if let Some(ref d) = detail {
-                (
-                    d.name.clone().unwrap_or_else(|| o.name.clone().unwrap_or_else(|| o.id.clone())),
-                    d.current_value.clone(),
-                    d.value.clone(),
-                    d.default.clone(),
-                    d.allowed.clone(),
-                    d.controlled_by_tester,
-                    d.frozen,
-                    d.requires_security,
-                    d.security_level,
-                )
-            } else {
-                (
-                    o.name.clone().unwrap_or_else(|| o.id.clone()),
-                    None, None, None, None, None, None, None, o.security_level,
-                )
-            };
+        let (
+            name,
+            current_state,
+            value,
+            default_value,
+            allowed,
+            controlled_by_tester,
+            frozen,
+            requires_security,
+            security_level,
+        ) = if let Some(ref d) = detail {
+            (
+                d.name
+                    .clone()
+                    .unwrap_or_else(|| o.name.clone().unwrap_or_else(|| o.id.clone())),
+                d.current_value.clone(),
+                d.value.clone(),
+                d.default.clone(),
+                d.allowed.clone(),
+                d.controlled_by_tester,
+                d.frozen,
+                d.requires_security,
+                d.security_level,
+            )
+        } else {
+            (
+                o.name.clone().unwrap_or_else(|| o.id.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                o.security_level,
+            )
+        };
 
         controls.push(IoControlInfo {
             id: o.id.clone(),
@@ -431,10 +459,18 @@ async fn io_control(
         _ => return Err(format!("Unknown I/O control action: {}", action)),
     };
 
-    match client.control_output(&component_id, &data_id, sovd_action, value).await {
+    match client
+        .control_output(&component_id, &data_id, sovd_action, value)
+        .await
+    {
         Ok(response) => Ok(IoControlResponse {
             success: response.success,
-            state: if response.controlled_by_tester { "controlled" } else { "released" }.to_string(),
+            state: if response.controlled_by_tester {
+                "controlled"
+            } else {
+                "released"
+            }
+            .to_string(),
             message: response.error,
             frozen: Some(response.frozen),
             new_value: response.new_value,
@@ -525,8 +561,8 @@ async fn export_logs(logs: Vec<LogEntry>, format: String) -> Result<(), String> 
         _ => return Err(format!("Unknown format: {}", format)),
     };
 
-    let mut file = std::fs::File::create(&path)
-        .map_err(|e| format!("Failed to create file: {}", e))?;
+    let mut file =
+        std::fs::File::create(&path).map_err(|e| format!("Failed to create file: {}", e))?;
     file.write_all(content.as_bytes())
         .map_err(|e| format!("Failed to write file: {}", e))?;
 
@@ -644,7 +680,7 @@ async fn set_session(
         value: mode
             .value
             .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| session),
+            .unwrap_or(session),
     })
 }
 
@@ -717,11 +753,15 @@ async fn send_security_key(
     let security_level = SecurityLevel(level);
 
     // Parse hex key string
-    let key_bytes = hex::decode(&key)
-        .map_err(|e| format!("Invalid hex key: {}", e))?;
+    let key_bytes = hex::decode(&key).map_err(|e| format!("Invalid hex key: {}", e))?;
 
     client
-        .security_access_send_key_targeted(&component_id, security_level, &key_bytes, target.as_deref())
+        .security_access_send_key_targeted(
+            &component_id,
+            security_level,
+            &key_bytes,
+            target.as_deref(),
+        )
         .await
         .map_err(|e| format!("Failed to send key: {}", e))?;
 
@@ -745,9 +785,14 @@ pub struct FlashProgress {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActivationInfo {
+    /// True while the banked trial is paused awaiting a commit/rollback
+    /// verdict (`x-sumo-substate == awaiting-verdict`).
     pub supports_rollback: bool,
+    /// Frontend-normalized lifecycle state (see `normalize_update_state`).
     pub state: String,
+    /// Installed software version (identData DID F189), if readable.
     pub active_version: Option<String>,
+    /// No `/updates` equivalent — always None (kept for frontend shape).
     pub previous_version: Option<String>,
 }
 
@@ -759,51 +804,136 @@ pub struct CommitRollbackResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UploadResult {
+    /// The latched `/updates` update_id (the part is uploaded into this id).
     pub upload_id: String,
+    /// The part id the bytes landed under (e.g. "manifest").
     pub file_id: Option<String>,
     pub state: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FlashResult {
+    /// The `/updates` update_id (no separate transfer id on the spec wire).
     pub transfer_id: String,
+    /// Frontend-normalized lifecycle state (see `normalize_update_state`).
     pub state: String,
+    /// No block-level accounting on `/updates` — always 0 (kept for shape).
     pub blocks_transferred: u32,
     pub blocks_total: u32,
+    /// `UpdateStatusBody.progress` (0..=100), if reported.
     pub percent: Option<f64>,
     pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransferInfo {
+    /// A registered update_id from `GET /updates`.
     pub transfer_id: String,
     pub state: String,
     pub error: Option<String>,
 }
 
-#[tauri::command]
-async fn flash_list_transfers(
-    state: State<'_, AppState>,
-) -> Result<Vec<TransferInfo>, String> {
-    let flash_client = state
+/// Map an ISO 17978-3 §7.18.7 `UpdateStatusBody` onto the snake_case
+/// lifecycle strings the frontend's `normalizeFlashState` understands.
+///
+/// - `status == "failed"`                        → `failed`
+/// - `x-sumo-substate == "awaiting-verdict"`     → `activated` (banked trial paused)
+/// - `x-sumo-substate == "rolling-back"`         → `rolled_back`
+/// - `x-sumo-substate == "committing"`           → `committed`
+/// - `status == "completed"` (prepare)           → `complete` (parts verified)
+/// - `status == "completed"` (execute/other)     → `complete`
+/// - otherwise (running)                         → `transferring`
+fn normalize_update_state(body: &sovd_client::flash::UpdateStatusBody) -> String {
+    if body.status == "failed" {
+        return "failed".to_string();
+    }
+    match body.substate.as_deref() {
+        Some("awaiting-verdict") => return "activated".to_string(),
+        Some("rolling-back") => return "rolled_back".to_string(),
+        Some("committing") => return "committed".to_string(),
+        _ => {}
+    }
+    if body.status == "completed" {
+        "complete".to_string()
+    } else {
+        "transferring".to_string()
+    }
+}
+
+/// Read the installed software version (identData DID F189) via the
+/// connected `SovdClient`.  On `/updates`, version is identData, not a
+/// field on the flash wire.  Best-effort: returns None on any failure.
+async fn read_installed_version(
+    state: &State<'_, AppState>,
+    component_id: &str,
+    app_path: Option<&str>,
+) -> Option<String> {
+    let client = state.client.lock().unwrap().clone()?;
+    let result = if let Some(path) = app_path {
+        client
+            .read_sub_entity_data(component_id, path, "F189")
+            .await
+    } else {
+        client.read_data(component_id, "F189").await
+    };
+    match result {
+        Ok(data) => {
+            if let Some(v) = data.value.as_str() {
+                Some(v.to_string())
+            } else if data.value.is_null() {
+                None
+            } else {
+                Some(data.value.to_string())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flash-driving commands — re-implemented on the ISO 17978-3 §7.18 `/updates`
+// wire.  The old `/files`+`/flash` verbs (start_flash / upload_file /
+// verify_file / transfer_exit / get_flash_status / commit_flash / ...) are
+// gone; each command body below maps onto the `/updates` lifecycle:
+//
+//   open_update → upload_part("manifest", ..) → prepare() → execute(true)
+//                 → spec_commit() | spec_rollback()
+//
+// FlashClient latches the update_id internally after open_update/upload, so
+// per-step commands no longer thread a transfer_id (the JS still passes one
+// for backward shape; it is the update_id and is ignored on the wire).
+// ---------------------------------------------------------------------------
+
+/// Pull the current flash client out of state, or error if uninitialized.
+fn take_flash_client(state: &State<'_, AppState>) -> Result<FlashClient, String> {
+    state
         .flash_client
         .lock()
         .unwrap()
         .clone()
-        .ok_or_else(|| "Flash client not initialized. Call flash_init first.".to_string())?;
+        .ok_or_else(|| "Flash client not initialized. Call flash_init first.".to_string())
+}
 
-    let response = flash_client
-        .list_transfers()
+/// `GET /updates` — registered update_ids on this component.  On `/updates`,
+/// a listed id is an in-flight session (cleared server-side on commit /
+/// rollback), so the frontend treats each as an existing transfer to cancel.
+/// State is reported as `registered`: real lifecycle state requires attaching,
+/// which would mutate the client's latched id, so we don't poll it here.
+#[tauri::command]
+async fn flash_list_transfers(state: State<'_, AppState>) -> Result<Vec<TransferInfo>, String> {
+    let flash_client = take_flash_client(&state)?;
+
+    let ids = flash_client
+        .list_updates()
         .await
-        .map_err(|e| format!("Failed to list transfers: {}", e))?;
+        .map_err(|e| format!("Failed to list updates: {}", e))?;
 
-    Ok(response
-        .transfers
+    Ok(ids
         .into_iter()
-        .map(|t| TransferInfo {
-            transfer_id: t.transfer_id,
-            state: format!("{:?}", t.state).to_lowercase(),
-            error: t.error.map(|e| e.message),
+        .map(|id| TransferInfo {
+            transfer_id: id,
+            state: "registered".to_string(),
+            error: None,
         })
         .collect())
 }
@@ -820,38 +950,50 @@ async fn flash_init(
         FlashClient::for_sovd_sub_entity(&server_url, gw, &component_id)
     } else {
         FlashClient::for_sovd(&server_url, &component_id)
-    }.map_err(|e| format!("Failed to create flash client: {}", e))?;
+    }
+    .map_err(|e| format!("Failed to create flash client: {}", e))?;
 
     *state.flash_client.lock().unwrap() = Some(flash_client);
     *state.current_flash_component.lock().unwrap() = Some(component_id);
+    *state.current_flash_gateway.lock().unwrap() = gateway_id;
 
     Ok(true)
+}
+
+/// Open a `/updates` session (if not already open) and stream the package in
+/// as the `manifest` part — the SUIT envelope.  Upload is synchronous on the
+/// spec wire (the PUT returns once the part is stored), so there is no
+/// separate upload-poll step.  `upload_id` is the latched update_id.
+async fn upload_manifest_part(
+    flash_client: &FlashClient,
+    data: &[u8],
+) -> Result<UploadResult, String> {
+    // Lazily opens the update session if none is open yet.
+    let part = flash_client
+        .upload_part("manifest", data)
+        .await
+        .map_err(|e| format!("Upload failed: {}", e))?;
+
+    let update_id = flash_client.current_update_id().await.unwrap_or_default();
+
+    Ok(UploadResult {
+        upload_id: update_id,
+        file_id: Some(part.part_id),
+        state: "complete".to_string(),
+    })
 }
 
 #[tauri::command]
 async fn flash_upload(
     state: State<'_, AppState>,
     data: Vec<u8>,
+    // Retained for backward call shape; `/updates` parts are keyed by part_id
+    // ("manifest"), not the source filename.
     filename: Option<String>,
 ) -> Result<UploadResult, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized. Call flash_init first.".to_string())?;
-
-    let upload = if let Some(name) = filename {
-        flash_client.upload_file_with_name(&data, Some(&name)).await
-    } else {
-        flash_client.upload_file(&data).await
-    }.map_err(|e| format!("Upload failed: {}", e))?;
-
-    Ok(UploadResult {
-        upload_id: upload.upload_id.clone(),
-        file_id: None, // file_id is available after polling
-        state: "uploading".to_string(),
-    })
+    let _ = filename;
+    let flash_client = take_flash_client(&state)?;
+    upload_manifest_part(&flash_client, &data).await
 }
 
 #[tauri::command]
@@ -859,270 +1001,237 @@ async fn flash_upload_from_path(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<UploadResult, String> {
-    // Read file from path
-    let data = std::fs::read(&path)
-        .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
-
-    // Extract filename from path
-    let filename = std::path::Path::new(&path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
-
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized. Call flash_init first.".to_string())?;
-
-    let upload = if let Some(name) = filename {
-        flash_client.upload_file_with_name(&data, Some(&name)).await
-    } else {
-        flash_client.upload_file(&data).await
-    }.map_err(|e| format!("Upload failed: {}", e))?;
-
-    Ok(UploadResult {
-        upload_id: upload.upload_id.clone(),
-        file_id: None,
-        state: "uploading".to_string(),
-    })
+    let data =
+        std::fs::read(&path).map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+    let flash_client = take_flash_client(&state)?;
+    upload_manifest_part(&flash_client, &data).await
 }
 
+/// Upload is synchronous on `/updates`; this is a back-compat echo so the
+/// frontend's optional upload-poll step still resolves.
 #[tauri::command]
 async fn flash_poll_upload(
     state: State<'_, AppState>,
     upload_id: String,
 ) -> Result<UploadResult, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
-
-    let status = flash_client
-        .get_upload_status(&upload_id)
-        .await
-        .map_err(|e| format!("Failed to get upload status: {}", e))?;
-
+    let _ = take_flash_client(&state)?;
     Ok(UploadResult {
         upload_id,
-        file_id: status.file_id,
-        state: format!("{:?}", status.state).to_lowercase(),
+        file_id: Some("manifest".to_string()),
+        state: "complete".to_string(),
     })
 }
 
+/// `PUT /updates/{id}/prepare` — verifies the uploaded parts (manifest).
+/// Async on the wire: the client polls `/status` to terminal internally.
+/// Returns true iff prepare reached `status == completed`.
 #[tauri::command]
 async fn flash_verify(
     state: State<'_, AppState>,
+    // Old wire keyed verify by file_id; the spec verb operates on the latched
+    // update session, so the argument is accepted but unused.
     file_id: String,
 ) -> Result<bool, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+    let _ = file_id;
+    let flash_client = take_flash_client(&state)?;
 
-    flash_client
-        .verify_file(&file_id)
+    let body = flash_client
+        .prepare()
         .await
-        .map_err(|e| format!("Verification failed: {}", e))?;
+        .map_err(|e| format!("Prepare/verify failed: {}", e))?;
 
+    if body.status != "completed" {
+        return Err(format!(
+            "Prepare ended at {}/{}{}",
+            body.phase,
+            body.status,
+            body.error
+                .map(|e| format!(": {}", e.message))
+                .unwrap_or_default()
+        ));
+    }
     Ok(true)
 }
 
+/// `PUT /updates/{id}/execute?x-sumo-control=orchestrated` — installs /
+/// activates the staged parts and pauses the banked trial at
+/// `awaiting-verdict` so the UI can offer Commit / Rollback.  The client
+/// polls `/status` internally; we map the terminal `UpdateStatusBody` onto
+/// the frontend's lifecycle state string.
 #[tauri::command]
 async fn flash_start(
     state: State<'_, AppState>,
+    // Old wire keyed flash-start by file_id; superseded by the latched
+    // update session.  Accepted but unused.
     file_id: String,
 ) -> Result<FlashResult, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+    let _ = file_id;
+    let flash_client = take_flash_client(&state)?;
 
-    let response = flash_client
-        .start_flash()
+    let body = flash_client
+        .execute(true)
         .await
-        .map_err(|e| format!("Failed to start flash: {}", e))?;
+        .map_err(|e| format!("Failed to execute update: {}", e))?;
 
     Ok(FlashResult {
-        transfer_id: response.transfer_id,
-        state: "flashing".to_string(),
+        transfer_id: flash_client.current_update_id().await.unwrap_or_default(),
+        state: normalize_update_state(&body),
         blocks_transferred: 0,
         blocks_total: 0,
-        percent: Some(0.0),
-        error: None,
+        percent: body.progress.map(|p| p as f64),
+        error: body.error.map(|e| e.message),
     })
 }
 
+/// `GET /updates/{id}/status` — the §7.18.7 lifecycle status, mapped onto a
+/// `FlashResult`.  Replaces the old per-transfer `get_flash_status`.
 #[tauri::command]
 async fn flash_poll_progress(
     state: State<'_, AppState>,
+    // The latched update session is the source of truth; the id is accepted
+    // for back-compat but not used to address the wire.
     transfer_id: String,
 ) -> Result<FlashResult, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+    let flash_client = take_flash_client(&state)?;
 
-    let status = flash_client
-        .get_flash_status(&transfer_id)
+    let body = flash_client
+        .spec_status()
         .await
-        .map_err(|e| format!("Failed to get flash status: {}", e))?;
-
-    let (blocks_transferred, blocks_total, percent) = status
-        .progress
-        .map(|p| (p.blocks_transferred, p.blocks_total, p.percent))
-        .unwrap_or((0, 0, None));
+        .map_err(|e| format!("Failed to get update status: {}", e))?;
 
     Ok(FlashResult {
         transfer_id,
-        state: format!("{:?}", status.state).to_lowercase(),
-        blocks_transferred,
-        blocks_total,
-        percent,
-        error: status.error.map(|e| e.message),
+        state: normalize_update_state(&body),
+        blocks_transferred: 0,
+        blocks_total: 0,
+        percent: body.progress.map(|p| p as f64),
+        error: body.error.map(|e| e.message),
     })
 }
 
+/// Abort: there is no `delete_update` on the current client, so abort maps to
+/// the trial-recovery vendor verb `PUT /components/{id}/x-sumo-force-rollback`
+/// (idempotent; unsticks a banked trial / abandoned session). Clears the
+/// in-process flash state afterwards.
 #[tauri::command]
 async fn flash_abort(
     state: State<'_, AppState>,
+    // No transfer to address on the spec wire; force-rollback acts on the
+    // component's trial. Accepted but unused.
     transfer_id: String,
 ) -> Result<bool, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+    let _ = transfer_id;
+    let flash_client = take_flash_client(&state)?;
 
     flash_client
-        .abort_flash(&transfer_id)
+        .force_rollback()
         .await
-        .map_err(|e| format!("Failed to abort flash: {}", e))?;
+        .map_err(|e| format!("Failed to abort (force-rollback) update: {}", e))?;
 
     Ok(true)
 }
 
+/// Finalize is folded into `execute` on `/updates` (PUT /execute installs +
+/// activates). Kept as a back-compat no-op that confirms the session is still
+/// reachable, so the frontend's discrete "Finalize" step resolves cleanly.
 #[tauri::command]
-async fn flash_finalize(
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
-
-    flash_client
-        .transfer_exit()
-        .await
-        .map_err(|e| format!("Transfer exit failed: {}", e))?;
-
+async fn flash_finalize(state: State<'_, AppState>) -> Result<bool, String> {
+    let flash_client = take_flash_client(&state)?;
+    // Best-effort touch; ignore status — execute already finalized.
+    let _ = flash_client.spec_status().await;
     Ok(true)
 }
 
+/// ECU reset (`PUT /components/{id}/status/restart`) — lives at the entity
+/// root, unchanged by the `/updates` migration.  The current API requires a
+/// reset_type; the explorer uses a hard reset.
 #[tauri::command]
-async fn flash_reset_ecu(
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+async fn flash_reset_ecu(state: State<'_, AppState>) -> Result<bool, String> {
+    let flash_client = take_flash_client(&state)?;
 
     flash_client
-        .ecu_reset()
+        .ecu_reset("hardReset")
         .await
         .map_err(|e| format!("ECU reset failed: {}", e))?;
 
     Ok(true)
 }
 
+/// `PUT /updates/{id}/x-sumo-commit` — accept the banked trial. The client
+/// clears its latched update_id on success; we also clear app-side flash
+/// state so a fresh cycle can begin.
 #[tauri::command]
-async fn flash_commit(
-    state: State<'_, AppState>,
-) -> Result<CommitRollbackResult, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+async fn flash_commit(state: State<'_, AppState>) -> Result<CommitRollbackResult, String> {
+    let flash_client = take_flash_client(&state)?;
 
-    let response = flash_client
-        .commit_flash()
+    let body = flash_client
+        .spec_commit()
         .await
         .map_err(|e| format!("Commit failed: {}", e))?;
 
-    // Clear flash client state after commit
     *state.flash_client.lock().unwrap() = None;
     *state.current_flash_component.lock().unwrap() = None;
+    *state.current_flash_gateway.lock().unwrap() = None;
 
+    let success = body.status == "completed";
     Ok(CommitRollbackResult {
-        success: response.success,
-        message: response.message,
+        success,
+        message: body.error.map(|e| e.message),
     })
 }
 
+/// `PUT /updates/{id}/x-sumo-rollback` — reject the banked trial. Same state
+/// cleanup as commit.
 #[tauri::command]
-async fn flash_rollback(
-    state: State<'_, AppState>,
-) -> Result<CommitRollbackResult, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+async fn flash_rollback(state: State<'_, AppState>) -> Result<CommitRollbackResult, String> {
+    let flash_client = take_flash_client(&state)?;
 
-    let response = flash_client
-        .rollback_flash()
+    let body = flash_client
+        .spec_rollback()
         .await
         .map_err(|e| format!("Rollback failed: {}", e))?;
 
-    // Clear flash client state after rollback
     *state.flash_client.lock().unwrap() = None;
     *state.current_flash_component.lock().unwrap() = None;
+    *state.current_flash_gateway.lock().unwrap() = None;
 
+    let success = body.status == "completed";
     Ok(CommitRollbackResult {
-        success: response.success,
-        message: response.message,
+        success,
+        message: body.error.map(|e| e.message),
     })
 }
 
+/// Activation state on `/updates` is the §7.18.7 lifecycle status itself.
+/// `supports_rollback` is true while the trial is paused at
+/// `awaiting-verdict`; the installed version comes from identData DID F189
+/// (read through the connected `SovdClient`, routed via the gateway for
+/// sub-entities). `previous_version` has no `/updates` equivalent.
 #[tauri::command]
-async fn flash_get_activation(
-    state: State<'_, AppState>,
-) -> Result<ActivationInfo, String> {
-    let flash_client = state
-        .flash_client
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Flash client not initialized".to_string())?;
+async fn flash_get_activation(state: State<'_, AppState>) -> Result<ActivationInfo, String> {
+    let flash_client = take_flash_client(&state)?;
 
-    let response = flash_client
-        .get_activation_state()
+    let body = flash_client
+        .spec_status()
         .await
-        .map_err(|e| format!("Failed to get activation state: {}", e))?;
+        .map_err(|e| format!("Failed to get update status: {}", e))?;
+
+    // Resolve where to read the version DID: sub-entity reads go through the
+    // gateway (component = gateway, app_path = flash component); top-level
+    // reads address the component directly.
+    let component = state.current_flash_component.lock().unwrap().clone();
+    let gateway = state.current_flash_gateway.lock().unwrap().clone();
+    let active_version = match (gateway, component) {
+        (Some(gw), Some(app)) => read_installed_version(&state, &gw, Some(&app)).await,
+        (None, Some(comp)) => read_installed_version(&state, &comp, None).await,
+        _ => None,
+    };
 
     Ok(ActivationInfo {
-        supports_rollback: response.supports_rollback,
-        state: response.state,
-        active_version: response.active_version,
-        previous_version: response.previous_version,
+        supports_rollback: body.is_awaiting_verdict(),
+        state: normalize_update_state(&body),
+        active_version,
+        previous_version: None,
     })
 }
 
@@ -1194,6 +1303,7 @@ async fn security_helper_info(state: State<'_, AppState>) -> Result<HelperInfo, 
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: params bound by name from JS.
 async fn security_helper_calculate(
     state: State<'_, AppState>,
     seed: String,
@@ -1295,8 +1405,7 @@ fn decode_jwt_claims_unverified(jwt: &str) -> Result<IdTokenClaims, String> {
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|e| format!("Failed to decode JWT payload: {}", e))?;
-    serde_json::from_slice(&payload)
-        .map_err(|e| format!("Failed to parse JWT claims: {}", e))
+    serde_json::from_slice(&payload).map_err(|e| format!("Failed to parse JWT claims: {}", e))
 }
 
 #[derive(Deserialize)]
@@ -1402,7 +1511,9 @@ async fn oidc_login(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server_handle = tokio::spawn(async move {
-        use axum::{extract::Query, response::Html, routing::get as axum_get, Router as AxumRouter};
+        use axum::{
+            extract::Query, response::Html, routing::get as axum_get, Router as AxumRouter,
+        };
 
         let tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
         let app = AxumRouter::new().route(
@@ -1418,7 +1529,8 @@ async fn oidc_login(
                         } else if let (Some(code), Some(state)) = (params.code, params.state) {
                             let _ = sender.send(Ok((code, state)));
                         } else {
-                            let _ = sender.send(Err("Missing code or state in callback".to_string()));
+                            let _ =
+                                sender.send(Err("Missing code or state in callback".to_string()));
                         }
                     }
                     Html(
@@ -1441,8 +1553,7 @@ async fn oidc_login(
     let callback_result = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
         .await
         .map_err(|_| "OIDC login timed out (120s). Please try again.".to_string())?
-        .map_err(|_| "Callback channel closed unexpectedly".to_string())?
-        .map_err(|e| e)?;
+        .map_err(|_| "Callback channel closed unexpectedly".to_string())??;
 
     let (auth_code, returned_state) = callback_result;
 

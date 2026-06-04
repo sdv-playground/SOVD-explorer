@@ -2626,16 +2626,11 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
 
   const handleCancelTransfer = async (tid: string, forComponentId: string) => {
     try {
-      // Init flash client for the component that owns this transfer
+      // Init flash client for the component that owns this update, then
+      // force-rollback to clear any banked trial / abandoned session.
       await invoke("flash_init", { componentId: forComponentId });
       await invoke("flash_abort", { transferId: tid });
-      // Also send transfer_exit to clear ECU's download state
-      try {
-        await invoke("flash_finalize");
-      } catch {
-        // Ignore - ECU might not be in a state that accepts transfer exit
-      }
-      addLog(`Cancelled transfer ${tid} on ${forComponentId}`);
+      addLog(`Cancelled update ${tid} on ${forComponentId}`);
       await checkExistingTransfers();
     } catch (e) {
       addLog(`Failed to cancel: ${e}`);
@@ -2766,82 +2761,42 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
       addLog("Switching to programming session...");
       await invoke("set_session", { componentId: apiComponentId, session: "programming", target: modeTarget });
 
-      // Phase 3: Flash
+      // Phase 3: Flash (PUT /updates/{id}/execute, orchestrated)
+      // The backend drives execute to a terminal state or pauses the banked
+      // trial at awaiting-verdict and returns the final /status synchronously.
       setPhase(PHASE.FLASHING);
       setProgress(0);
-      addLog("Starting flash transfer to ECU...");
+      addLog("Installing update on ECU (execute)...");
 
       const flashResult = await invoke<FlashResult>("flash_start", {
         fileId: uploadedFileId,
       });
       setTransferId(flashResult.transfer_id);
-      addLog(`Flash started (Transfer ID: ${flashResult.transfer_id})`);
+      addLog(`Update id: ${flashResult.transfer_id}`);
+      setProgress(flashResult.percent ?? 100);
 
-      // Poll flash progress
-      let flashComplete = false;
-      while (!flashComplete) {
-        await new Promise((r) => setTimeout(r, 500));
-        const status = await invoke<FlashResult>("flash_poll_progress", {
-          transferId: flashResult.transfer_id,
-        });
-
-        const percent = status.percent ??
-          (status.blocks_total > 0
-            ? (status.blocks_transferred / status.blocks_total) * 100
-            : 0);
-        setProgress(percent);
-
-        if (status.blocks_total > 0) {
-          addLog(`Flashing: ${status.blocks_transferred}/${status.blocks_total} blocks (${percent.toFixed(1)}%)`);
-        }
-
-        const ns = normalizeFlashState(status.state);
-        if (ns === STATE.COMPLETE || ns === STATE.AWAITING_EXIT) {
-          flashComplete = true;
-          addLog("Flash transfer complete");
-        } else if (ns === "failed") {
-          throw new Error(`Flash failed: ${status.error || "Unknown error"}`);
-        }
+      const ns = normalizeFlashState(flashResult.state);
+      if (ns === STATE.FAILED) {
+        throw new Error(`Execute failed: ${flashResult.error || "Unknown error"}`);
       }
 
-      // Phase 4: Finalize
+      // Phase 4: Finalize (folded into execute on /updates — confirm only)
       setPhase(PHASE.FINALIZING);
-      setProgress(0);
-      addLog("Finalizing transfer...");
-
-      await invoke("flash_finalize");
-      addLog("Transfer exit sent");
-      setProgress(50);
-
-      // Poll progress to detect awaiting_reset state
-      let needsReset = false;
-      for (let i = 0; i < 10; i++) {
-        await new Promise((r) => setTimeout(r, 500));
-        try {
-          const status = await invoke<FlashResult>("flash_poll_progress", {
-            transferId: flashResult.transfer_id,
-          });
-          const ns2 = normalizeFlashState(status.state);
-          if (ns2 === STATE.AWAITING_RESET) {
-            needsReset = true;
-            break;
-          }
-          if (ns2 === STATE.COMPLETE) {
-            break;
-          }
-        } catch {
-          // Poll may fail if transfer is already done
-          break;
-        }
-      }
       setProgress(100);
+      await invoke("flash_finalize");
+      addLog("Execute complete");
 
-      if (needsReset) {
-        // ECU needs a reset — stop here and let the user decide
-        setPhase(PHASE.RESETTING);
-        addLog("Awaiting ECU reset. Click 'Reset ECU' or power-cycle the ECU externally.");
+      if (ns === STATE.ACTIVATED) {
+        // Banked trial paused awaiting a commit/rollback verdict.
+        const activation = await invoke<ActivationInfo>("flash_get_activation");
+        setActivationState(activation);
+        if (activation.active_version) setSwVersionAfter(activation.active_version);
+        setPhase(PHASE.ACTIVATED);
+        addLog("Firmware activated. Commit to make permanent, or Rollback to revert.");
+        // ECU may have rebooted into the trial — refresh parent session/security.
+        onUpdateComplete?.();
       } else {
-        // No reset needed — read version and complete
+        // Singleshot / auto-commit path — execute already finalized.
         const versionAfter = await readSwVersion();
         if (versionAfter) {
           setSwVersionAfter(versionAfter);
