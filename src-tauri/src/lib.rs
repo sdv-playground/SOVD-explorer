@@ -231,23 +231,12 @@ async fn read_parameter(
     result.map_err(|e| format!("Failed to read parameter: {}", e))
 }
 
-#[tauri::command]
-async fn read_parameter_raw(
-    state: State<'_, AppState>,
-    component_id: String,
-    parameter_id: String,
-    app_path: Option<String>,
-) -> Result<DataResponse, String> {
-    let client = get_client(&state)?;
-    let result = if let Some(ref path) = app_path {
-        client
-            .read_sub_entity_data_raw(&component_id, path, &parameter_id)
-            .await
-    } else {
-        client.read_data_raw(&component_id, &parameter_id).await
-    };
-    result.map_err(|e| format!("Failed to read raw parameter: {}", e))
-}
+// Raw/unconverted bytes are NOT a separate read command. Every normal read already
+// carries them in `DataResponse.raw` (rendered directly by the frontend's raw-cell).
+// The old `?raw=true` path (read_data_raw) was removed: it routed to the server's
+// `read_raw_did`, which aggregating entities (gateways) don't implement, so it 501'd.
+// The normal read works through gateways (read_data forwards to children) and the
+// `raw` field is the spec-aligned way to expose unconverted bytes.
 
 // Feature 1: Write Parameters
 #[tauri::command]
@@ -1640,7 +1629,6 @@ pub fn run() {
             // Data
             list_parameters,
             read_parameter,
-            read_parameter_raw,
             write_parameter,
             // ECU Info
             get_ecu_info,
