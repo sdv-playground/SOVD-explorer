@@ -1,5 +1,9 @@
 # Architecture: SOVD Explorer
 
+> Refreshed 2026-06-07 — flash-driving migrated to the SOVDd `/updates` wire (ISO 17978-3
+> §7.18); `read_parameter_raw` dropped (raw bytes ride the normal read). The Tauri 2 /
+> React stack and most views are unchanged.
+
 ## Overview
 
 SOVD Explorer is a desktop GUI for interacting with automotive ECUs via the **SOVD (Service-Oriented Vehicle Diagnostics)** protocol. It connects to a SOVDd server, discovers vehicle components (ECUs and gateways), and provides a tabbed interface for reading/writing parameters, viewing faults, executing operations, controlling I/O, performing firmware updates, and managing diagnostic sessions/security access. ECUs behind gateways are accessed via spec-compliant sub-entity routing (SOVD §6.5).
@@ -8,8 +12,8 @@ SOVD Explorer is a desktop GUI for interacting with automotive ECUs via the **SO
 
 | Language   | Files | Code Lines |
 |------------|-------|------------|
-| Rust       | 4     | ~1,585     |
-| TSX        | 2     | ~2,990     |
+| Rust       | 4     | ~1,675     |
+| TSX        | 2     | ~3,312     |
 | CSS        | 2     | ~2,004     |
 | TypeScript | 2     | 19         |
 | Other      | 22    | ~9,100     |
@@ -70,9 +74,9 @@ graph LR
 
 The application is a **single-module monolith** — both frontend and backend are each contained in a single file.
 
-### Backend (`src-tauri/src/lib.rs` — 1,528 lines)
+### Backend (`src-tauri/src/lib.rs` — ~1,675 lines)
 
-Flat structure: one `pub fn run()` entry point, ~43 Tauri command functions, ~20 response/helper structs, 1 `AppState` struct, 1 embedded axum callback server for OIDC.
+Flat structure: one `pub fn run()` entry point, ~41 Tauri command functions, ~20 response/helper structs, 1 `AppState` struct, 1 embedded axum callback server for OIDC.
 
 **AppState** (line 16):
 | Field | Type | Purpose |
@@ -81,11 +85,12 @@ Flat structure: one `pub fn run()` entry point, ~43 Tauri command functions, ~20
 | `server_url` | `Mutex<String>` | Connected server URL |
 | `flash_client` | `Mutex<Option<FlashClient>>` | Active flash session |
 | `current_flash_component` | `Mutex<Option<String>>` | ECU being flashed |
+| `current_flash_gateway` | `Mutex<Option<String>>` | Gateway id for an in-flight sub-entity flash — routes the identData (F189) installed-version read through the gateway |
 | `helper_url` | `Mutex<Option<String>>` | Security helper endpoint |
 | `helper_token` | `Mutex<Option<String>>` | Security helper auth token (static or OIDC JWT) |
 | `http_client` | `reqwest::Client` | Shared HTTP client for helper calls |
 
-### Frontend (`src/App.tsx` — 2,981 lines)
+### Frontend (`src/App.tsx` — ~3,312 lines)
 
 All components in one file:
 
@@ -260,45 +265,36 @@ sequenceDiagram
 
 ### Firmware Update Flow
 
+Drives the SOVDd **`/updates`** wire (ISO 17978-3 §7.18) since commit `4901d6c` — the older
+`/files` + `/flash` polling flow is gone. The backend `FlashClient` maps the UI phases onto
+`open_update → upload_part("manifest") → prepare → execute(orchestrated) → commit/rollback`.
+
 ```mermaid
 sequenceDiagram
     participant User
     participant SW as SoftwareTab
     participant BE as Rust Backend
-    participant ECU as SOVDd/ECU
+    participant ECU as SOVDd /updates (§7.18)
 
-    User->>SW: Select file + "Start Update"
+    User->>SW: Select package + "Start Update"
     SW->>BE: flash_init(componentId, gatewayId?)
-    SW->>BE: flash_upload(data) / flash_upload_from_path(path)
-    SW->>BE: flash_verify(fileId)
+    SW->>BE: flash_upload(data)   %% PUT /updates/{id}/bulk-data/manifest
+    SW->>BE: flash_verify()       %% PUT prepare — verifies the manifest
     SW->>BE: set_session(apiComponentId, "programming", modeTarget?)
-    SW->>BE: flash_start(fileId)
-    loop Poll Progress
-        SW->>BE: flash_poll_progress(transferId)
-        BE-->>SW: FlashResult{state, percent}
-    end
-    SW->>BE: flash_finalize()
-    loop Detect awaiting_reset
-        SW->>BE: flash_poll_progress(transferId)
-    end
+    SW->>BE: flash_start()        %% PUT execute?x-sumo-control=orchestrated
+    Note right of BE: execute is synchronous on the wire (it polls /updates<br/>internally) and returns a TERMINAL state — no flash-phase<br/>polling loop in the UI; blocks_* unused, percent only.
+    BE-->>SW: FlashResult{percent, state}
 
-    alt needsReset
-        SW->>SW: Enter "resetting" phase
-        User->>SW: Click "Reset ECU"
-        SW->>BE: flash_reset_ecu()
-        loop Background poll (3s interval)
-            SW->>BE: flash_get_activation()
-            Note right of BE: ECU offline during reboot
-            BE-->>SW: ActivationInfo{state}
+    alt Banked — execute pauses at awaiting-verdict (= activated, trial)
+        SW->>BE: flash_finalize()       %% back-compat no-op (execute already finalized)
+        SW->>BE: flash_reset_ecu()      %% UDS 0x11 when the orchestrator is ready
+        loop Background poll (3s)
+            SW->>BE: flash_get_activation()  %% /updates status + read F189 (installed version)
         end
-        alt supports_rollback
-            SW->>SW: Show Commit/Rollback UI
-            User->>SW: Click "Commit"
-            SW->>BE: flash_commit()
-        else no rollback
-            SW->>SW: Phase → complete
-        end
-    else no reset needed
+        SW->>SW: Show Commit / Rollback UI
+        User->>SW: Commit / Rollback
+        SW->>BE: flash_commit() / flash_rollback()  %% PUT x-sumo-commit / x-sumo-rollback
+    else Singleshot — write-through, no rollback
         SW->>SW: Phase → complete
     end
 ```
@@ -402,19 +398,14 @@ sequenceDiagram
 ### SoftwareTab State Machine
 
 ```
-idle → uploading → verifying → flashing → finalizing
-                                              ↓
-                                    ┌─── needsReset? ───┐
-                                    ↓ yes               ↓ no
-                                resetting            complete
-                                    ↓
-                            (background poll 3s)
-                                    ↓
-                        ┌── supports_rollback? ──┐
-                        ↓ yes                    ↓ no
-                    activated                 complete
-                    ↓       ↓
-                committed  rolledback
+idle → uploading → verifying → flashing (execute returns a terminal state)
+                                     │
+              ┌──────────────────────┴───────────────────────┐
+        Banked (trial)                                   Singleshot
+        activated (awaiting-verdict)                     complete
+              │ reset → background poll (3s)
+              ▼
+        committed | rolledback
 ```
 
 Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `rolledback`, `error`) show the "New Update" button.
@@ -436,12 +427,11 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 | `list_apps` | `component_id` | `Vec<AppInfo>` | List sub-entities (apps) under a gateway |
 | `list_sub_entity_apps` | `component_id, app_id` | `Vec<AppInfo>` | List apps under a nested sub-entity |
 
-### Data / Parameters (5 commands)
+### Data / Parameters (4 commands)
 | Command | Parameters | Returns | Description |
 |---------|-----------|---------|-------------|
 | `list_parameters` | `component_id` | `Vec<ParameterInfo>` | List parameter definitions |
-| `read_parameter` | `component_id, parameter_id` | `DataResponse` | Read single parameter value |
-| `read_parameter_raw` | `component_id, parameter_id` | `DataResponse` | Read raw (unconverted) parameter value |
+| `read_parameter` | `component_id, parameter_id` | `DataResponse` | Read a parameter; the unconverted `raw` bytes ride the same response (the old `read_parameter_raw` / `?raw=true` was dropped — gateways don't implement `read_raw_did`) |
 | `write_parameter` | `component_id, data_id, value` | `()` | Write parameter value |
 | `get_ecu_info` | `component_id` | `HashMap<String,String>` | Read standard DIDs (VIN, serial, versions, etc.) |
 
@@ -489,12 +479,12 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 | `flash_upload_from_path` | `path` | `UploadResult` | Upload firmware from file path |
 | `flash_poll_upload` | `upload_id` | `UploadResult` | Poll upload status |
 | `flash_verify` | `file_id` | `bool` | Verify uploaded package |
-| `flash_start` | `file_id` | `FlashResult` | Start flash transfer |
-| `flash_poll_progress` | `transfer_id` | `FlashResult` | Poll flash progress |
-| `flash_abort` | `transfer_id` | `bool` | Abort flash transfer |
-| `flash_finalize` | — | `bool` | Send transfer_exit |
-| `flash_reset_ecu` | — | `bool` | Send ECU reset command |
-| `flash_get_activation` | — | `ActivationInfo` | Get firmware activation state |
+| `flash_start` | — | `FlashResult` | `PUT execute?x-sumo-control=orchestrated` — synchronous on the wire, returns a terminal state (no `file_id`; the `/updates` part id is the fixed `"manifest"`) |
+| `flash_poll_progress` | `transfer_id` | `FlashResult` | Poll `/updates` status (`percent` only; `blocks_*` unused) |
+| `flash_abort` | `transfer_id` | `bool` | Abort via `force_rollback` (idempotent vendor verb) |
+| `flash_finalize` | — | `bool` | Back-compat no-op (`execute` already finalized) |
+| `flash_reset_ecu` | — | `bool` | UDS 0x11 ECU reset (when the orchestrator is ready) |
+| `flash_get_activation` | — | `ActivationInfo` | `/updates` status + reads identData F189 for the installed version (`previous_version` is unset on `/updates`) |
 | `flash_commit` | — | `CommitRollbackResult` | Make activated firmware permanent |
 | `flash_rollback` | — | `CommitRollbackResult` | Revert to previous firmware |
 
@@ -503,7 +493,7 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 |---------|-----------|---------|-------------|
 | `export_logs` | `logs, format` | `()` | Save logs via native file dialog (JSON/CSV/TXT) |
 
-**Total: 43 Tauri commands**
+**Total: ~41 Tauri commands**
 
 ## External Dependencies
 
@@ -601,7 +591,7 @@ cd sovd-explorer
 4. Style the dark theme (index.css + App.css header, sidebar, tree)
 
 **Phase 2 — Parameter Reading**
-5. Implement `list_parameters`, `read_parameter`, `read_parameter_raw`, `get_ecu_info`
+5. Implement `list_parameters`, `read_parameter`, `write_parameter`, `get_ecu_info`
 6. Build `ComponentDetails` with tab container, gateway-aware routing (`apiComponentId`, `modeTarget`, `paramPrefix`)
 7. Build `DataTab` with parameter table, search filter, source column, monitoring
 8. Add session/security display in header (`get_session`, `get_security` with `target` parameter)
