@@ -3,6 +3,7 @@ use sovd_client::{
     AppInfo, Component, DataResponse, FaultInfo, FlashClient, OperationExecution, OperationInfo,
     ParameterInfo, SecurityLevel, SovdClient,
 };
+use sovd_core::EntityStatus;
 use sovd_uds::uds::standard_did;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -785,6 +786,20 @@ pub struct ActivationInfo {
     pub previous_version: Option<String>,
 }
 
+/// Converged runtime status from `GET /{entity}/status` (ISO 17978-3 §7.19.2).
+/// `ready` is the standard `EntityStatus` (`Ready` → `true`); the rest are the
+/// vendor `x-sumo-runtime` passthrough: `boot_id` (per-guest-lifetime nonce —
+/// the canonical "has-rebooted" signal), `hb_seq` (heartbeat liveness,
+/// advances ~1/s) and `boot_count` (NV reset counter). All optional: the
+/// vendor block may be absent on a spec-pure entity.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RuntimeStatus {
+    pub ready: Option<bool>,
+    pub boot_id: Option<u32>,
+    pub hb_seq: Option<u32>,
+    pub boot_count: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommitRollbackResult {
     pub success: bool,
@@ -1221,6 +1236,37 @@ async fn flash_get_activation(state: State<'_, AppState>) -> Result<ActivationIn
         state: normalize_update_state(&body),
         active_version,
         previous_version: None,
+    })
+}
+
+/// `GET /vehicle/v1/components/{id}/status` — the converged runtime status
+/// (ISO 17978-3 §7.19.2). Independent of any in-flight flash session: it reads
+/// through the connected `SovdClient`, not the flash client. Maps the standard
+/// `EntityStatus` onto `ready`, and surfaces the vendor `x-sumo-runtime`
+/// passthrough (`boot_id` lifetime nonce, `hb_seq` heartbeat, `boot_count` NV
+/// reset counter). Vendor fields are best-effort — absent ones stay `None`.
+#[tauri::command]
+async fn read_status(
+    state: State<'_, AppState>,
+    component_id: String,
+) -> Result<RuntimeStatus, String> {
+    let client = get_client(&state)?;
+
+    let body = client
+        .read_status(&component_id)
+        .await
+        .map_err(|e| format!("Failed to read status: {}", e))?;
+
+    let ready = Some(body.status == EntityStatus::Ready);
+
+    let runtime = body.extensions.get("x-sumo-runtime");
+    let field = |key: &str| runtime.and_then(|r| r.get(key)).and_then(|v| v.as_u64());
+
+    Ok(RuntimeStatus {
+        ready,
+        boot_id: field("boot_id").map(|n| n as u32),
+        hb_seq: field("hb_seq").map(|n| n as u32),
+        boot_count: field("boot_count"),
     })
 }
 
@@ -1669,6 +1715,7 @@ pub fn run() {
             flash_commit,
             flash_rollback,
             flash_get_activation,
+            read_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -2341,6 +2341,17 @@ interface ActivationInfo {
   previous_version: string | null;
 }
 
+// Converged SOVD /status read (ISO 17978-3 §7.19.2). `ready` is the standard
+// EntityStatus; boot_id (lifetime nonce — the canonical "has-rebooted" signal),
+// hb_seq (heartbeat liveness) and boot_count (NV reset counter) are the vendor
+// x-sumo-runtime passthrough.
+interface RuntimeStatus {
+  ready: boolean | null;
+  boot_id: number | null;
+  hb_seq: number | null;
+  boot_count: number | null;
+}
+
 interface CommitRollbackResult {
   success: boolean;
   message: string | null;
@@ -2374,6 +2385,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
   const [swVersionBefore, setSwVersionBefore] = useState<string | null>(null);
   const [swVersionAfter, setSwVersionAfter] = useState<string | null>(null);
   const [activationState, setActivationState] = useState<ActivationInfo | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
 
   const addLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -2549,6 +2561,7 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     setSwVersionAfter(null);
     setCurrentSwVersion(null);
     setActivationState(null);
+    setRuntimeStatus(null);
     setLogs([]);
 
     // Hydrate from server state first; only check other transfers if idle
@@ -2559,6 +2572,10 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     });
     // Read current SW version on load
     readSwVersion().then(v => setCurrentSwVersion(v));
+    // Read converged /status (guest health + x-sumo-runtime) on load
+    invoke<RuntimeStatus>("read_status", { componentId })
+      .then(setRuntimeStatus)
+      .catch(() => setRuntimeStatus(null));
   }, [componentId]);
 
   // Read software version from ECU (parameter reads route through gateway)
@@ -3067,6 +3084,33 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
         <div className="current-version">
           <span className="version-label">Current Version:</span>
           <span className="version-value">{currentSwVersion}</span>
+        </div>
+      )}
+
+      {/* Runtime status (converged SOVD /status — guest health + x-sumo-runtime) */}
+      {runtimeStatus && (
+        <div className="runtime-status">
+          <span className={`health-badge ${runtimeStatus.ready ? "ready" : "not-ready"}`}>
+            {runtimeStatus.ready ? "ready" : "notReady"}
+          </span>
+          {runtimeStatus.boot_id != null && (
+            <span className="runtime-field">
+              <span className="runtime-label">lifetime</span>
+              <span className="runtime-value">{runtimeStatus.boot_id}</span>
+            </span>
+          )}
+          {runtimeStatus.hb_seq != null && (
+            <span className="runtime-field">
+              <span className="runtime-label">heartbeat</span>
+              <span className="runtime-value">{runtimeStatus.hb_seq}</span>
+            </span>
+          )}
+          {runtimeStatus.boot_count != null && (
+            <span className="runtime-field">
+              <span className="runtime-label">boot count</span>
+              <span className="runtime-value">{runtimeStatus.boot_count}</span>
+            </span>
+          )}
         </div>
       )}
 

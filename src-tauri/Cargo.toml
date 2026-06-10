@@ -31,6 +31,7 @@ open = "5"
 
 # SOVD crates from git
 sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sovd-uds = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main", default-features = false }
 
 [profile.release]
