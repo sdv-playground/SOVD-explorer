@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sovd_client::{
-    AppInfo, Component, DataResponse, FaultInfo, FlashClient, OperationExecution, OperationInfo,
-    ParameterInfo, SecurityLevel, SovdClient,
+    AppInfo, Component, DataResponse, FaultInfo, FlashClient, FlashConfig, OperationExecution,
+    OperationInfo, ParameterInfo, SecurityLevel, SovdClient,
 };
 use sovd_core::EntityStatus;
 use sovd_uds::uds::standard_did;
@@ -16,6 +16,10 @@ use tauri::State;
 struct AppState {
     client: Mutex<Option<SovdClient>>,
     server_url: Mutex<String>,
+    /// Skip TLS certificate verification (the `curl -k` equivalent) for the
+    /// active connection. Set at `connect`; reused by the flash client so it
+    /// dials the device on the same trust terms. Default `false`.
+    insecure: Mutex<bool>,
     flash_client: Mutex<Option<FlashClient>>,
     current_flash_component: Mutex<Option<String>>,
     /// Gateway id for the in-flight flash, if the target is a sub-entity.
@@ -31,6 +35,7 @@ impl Default for AppState {
         Self {
             client: Mutex::new(None),
             server_url: Mutex::new("http://localhost:4000".to_string()),
+            insecure: Mutex::new(false),
             flash_client: Mutex::new(None),
             current_flash_component: Mutex::new(None),
             current_flash_gateway: Mutex::new(None),
@@ -83,14 +88,16 @@ pub struct SecurityInfo {
 async fn connect(
     state: State<'_, AppState>,
     server_url: String,
+    insecure: bool,
 ) -> Result<ConnectionStatus, String> {
-    match SovdClient::new(&server_url) {
+    match SovdClient::new_insecure(&server_url, insecure) {
         Ok(client) => {
             // Test the connection with a health check
             match client.health().await {
                 Ok(_) => {
                     *state.client.lock().unwrap() = Some(client);
                     *state.server_url.lock().unwrap() = server_url.clone();
+                    *state.insecure.lock().unwrap() = insecure;
                     Ok(ConnectionStatus {
                         connected: true,
                         server_url,
@@ -949,13 +956,16 @@ async fn flash_init(
     gateway_id: Option<String>,
 ) -> Result<bool, String> {
     let server_url = state.server_url.lock().unwrap().clone();
+    // Reuse the trust decision the operator made at connect, so the flash
+    // client dials the device on the same TLS terms as the browse client.
+    let insecure = *state.insecure.lock().unwrap();
 
-    let flash_client = if let Some(ref gw) = gateway_id {
-        FlashClient::for_sovd_sub_entity(&server_url, gw, &component_id)
-    } else {
-        FlashClient::for_sovd(&server_url, &component_id)
+    let mut config = FlashConfig::builder(&server_url).component_id(&component_id);
+    if let Some(ref gw) = gateway_id {
+        config = config.gateway_id(gw);
     }
-    .map_err(|e| format!("Failed to create flash client: {}", e))?;
+    let flash_client = FlashClient::new(config.insecure(insecure).build())
+        .map_err(|e| format!("Failed to create flash client: {}", e))?;
 
     *state.flash_client.lock().unwrap() = Some(flash_client);
     *state.current_flash_component.lock().unwrap() = Some(component_id);

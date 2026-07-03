@@ -253,6 +253,7 @@ function hexToAscii(hex: string): string {
 
 function App() {
   const [serverUrl, setServerUrl] = useState("http://localhost:4000");
+  const [insecureTls, setInsecureTls] = useState<boolean>(() => localStorage.getItem("sovd_insecure_tls") === "true");
   const [connected, setConnected] = useState(false);
   const [componentTree, setComponentTree] = useState<ComponentTreeNode[]>([]);
   const [selectedComponent, setSelectedComponent] = useState<string | null>(null);
@@ -293,7 +294,8 @@ function App() {
 
   const checkConnection = async () => {
     try {
-      const status = await invoke<ConnectionStatus>("connect", { serverUrl });
+      localStorage.setItem("sovd_insecure_tls", String(insecureTls));
+      const status = await invoke<ConnectionStatus>("connect", { serverUrl, insecure: insecureTls });
       setConnected(status.connected);
       if (status.error) {
         setError(status.error);
@@ -589,6 +591,14 @@ function App() {
                       Connect
                     </button>
                   </div>
+                  <label className="settings-row" style={{ marginTop: "6px", fontSize: "12px", opacity: 0.85, cursor: "pointer", gap: "6px", alignItems: "center" }} title="Skip TLS certificate verification (curl -k). Needed for a device cert whose SAN won't match a raw IP.">
+                    <input
+                      type="checkbox"
+                      checked={insecureTls}
+                      onChange={(e) => setInsecureTls(e.target.checked)}
+                    />
+                    Insecure TLS (skip verify)
+                  </label>
                 </div>
                 <div className="settings-group">
                   <label className="settings-label">Security Helper</label>
