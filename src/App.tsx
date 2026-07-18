@@ -272,7 +272,11 @@ function App() {
   const checkConnection = async () => {
     try {
       localStorage.setItem("sovd_insecure_tls", String(insecureTls));
-      const status = await invoke<ConnectionStatus>("connect", { serverUrl, insecure: insecureTls });
+      const status = await invoke<ConnectionStatus>("connect", {
+        serverUrl,
+        insecure: insecureTls,
+        authToken: localStorage.getItem("sovd_auth_token") ?? undefined,
+      });
       setConnected(status.connected);
       if (status.error) {
         setError(status.error);
@@ -446,18 +450,26 @@ function App() {
         email: result.email || result.provider,
         provider: result.provider,
       });
+      // Re-connect so the SOVD client picks up the fresh bearer token.
+      if (connected) {
+        await checkConnection();
+      }
     } catch (e) {
       setError(`OIDC login failed: ${e}`);
     } finally {
       setOidcLoggingIn(false);
     }
-  }, [oidcIssuer, oidcClientId]);
+  }, [oidcIssuer, oidcClientId, connected, checkConnection]);
 
   // OIDC sign out — clear token and user state
   const oidcSignOut = useCallback(() => {
     setOidcUser(null);
     localStorage.removeItem("sovd_auth_token");
-  }, []);
+    // Re-connect so the SOVD client drops the bearer token.
+    if (connected) {
+      checkConnection();
+    }
+  }, [connected, checkConnection]);
 
   const toggleSettings = () => {
     setSettingsOpen(prev => {

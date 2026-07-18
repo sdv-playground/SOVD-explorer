@@ -85,8 +85,16 @@ async fn connect(
     state: State<'_, AppState>,
     server_url: String,
     insecure: bool,
+    auth_token: Option<String>,
 ) -> Result<ConnectionStatus, String> {
-    match SovdClient::new_insecure(&server_url, insecure) {
+    // Reads are open; writes need the signed-in OIDC bearer. When the
+    // front-end passes a token, every request carries it as
+    // `Authorization: Bearer <token>`; otherwise connect anonymously.
+    let client = match auth_token.as_deref().filter(|t| !t.is_empty()) {
+        Some(token) => SovdClient::with_bearer_token_insecure(&server_url, token, insecure),
+        None => SovdClient::new_insecure(&server_url, insecure),
+    };
+    match client {
         Ok(client) => {
             // Test the connection with a health check
             match client.health().await {
