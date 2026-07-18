@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sovd_client::{
     AppInfo, Component, DataResponse, FaultInfo, FlashClient, FlashConfig, OperationExecution,
-    OperationInfo, ParameterInfo, SecurityLevel, SovdClient,
+    OperationInfo, ParameterInfo, SovdClient,
 };
 use sovd_core::EntityStatus;
 use sovd_uds::uds::standard_did;
@@ -25,8 +25,7 @@ struct AppState {
     /// Gateway id for the in-flight flash, if the target is a sub-entity.
     /// Used to route identData (F189) version reads through the gateway.
     current_flash_gateway: Mutex<Option<String>>,
-    helper_url: Mutex<Option<String>>,
-    helper_token: Mutex<Option<String>>,
+    /// HTTP client for the OIDC flow (discovery + token exchange).
     http_client: reqwest::Client,
 }
 
@@ -39,14 +38,12 @@ impl Default for AppState {
             flash_client: Mutex::new(None),
             current_flash_component: Mutex::new(None),
             current_flash_gateway: Mutex::new(None),
-            helper_url: Mutex::new(None),
-            helper_token: Mutex::new(None),
             http_client: reqwest::Client::new(),
         }
     }
 }
 
-/// Helper to get a cloned client (SovdClient is Clone)
+/// Get a cloned client (SovdClient is Clone)
 fn get_client(state: &State<'_, AppState>) -> Result<SovdClient, String> {
     state
         .client
@@ -77,7 +74,6 @@ pub struct SessionInfo {
 pub struct SecurityInfo {
     pub id: String,
     pub value: String,
-    pub seed: Option<String>,
 }
 
 // =============================================================================
@@ -693,79 +689,12 @@ async fn get_security(
         .await
         .map_err(|e| format!("Failed to get security: {}", e))?;
 
-    // Spec shape (ISO 17978-3): seed is a concatenated lowercase
-    // hex string directly on the mode object, e.g. "aabbccdd".
-    let seed_str = mode
-        .seed
-        .as_ref()
-        .and_then(|s| s.as_str().map(|s| s.to_string()));
-
     Ok(SecurityInfo {
         id: mode.id,
         value: mode
             .value
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "locked".to_string()),
-        seed: seed_str,
-    })
-}
-
-#[tauri::command]
-async fn request_security_seed(
-    state: State<'_, AppState>,
-    component_id: String,
-    level: u8,
-    target: Option<String>,
-) -> Result<SecurityInfo, String> {
-    let client = get_client(&state)?;
-    let security_level = SecurityLevel(level);
-    let seed_bytes = client
-        .security_access_request_seed_targeted(&component_id, security_level, target.as_deref())
-        .await
-        .map_err(|e| format!("Failed to request seed: {}", e))?;
-
-    // Convert seed bytes to hex string
-    let seed_hex = seed_bytes
-        .iter()
-        .map(|b| format!("0x{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    Ok(SecurityInfo {
-        id: "security".to_string(),
-        value: format!("level{}_seedavailable", security_level.as_level_number()),
-        seed: Some(seed_hex),
-    })
-}
-
-#[tauri::command]
-async fn send_security_key(
-    state: State<'_, AppState>,
-    component_id: String,
-    level: u8,
-    key: String,
-    target: Option<String>,
-) -> Result<SecurityInfo, String> {
-    let client = get_client(&state)?;
-    let security_level = SecurityLevel(level);
-
-    // Parse hex key string
-    let key_bytes = hex::decode(&key).map_err(|e| format!("Invalid hex key: {}", e))?;
-
-    client
-        .security_access_send_key_targeted(
-            &component_id,
-            security_level,
-            &key_bytes,
-            target.as_deref(),
-        )
-        .await
-        .map_err(|e| format!("Failed to send key: {}", e))?;
-
-    Ok(SecurityInfo {
-        id: "security".to_string(),
-        value: format!("level{}", security_level.as_level_number()),
-        seed: None,
     })
 }
 
@@ -1281,129 +1210,6 @@ async fn read_status(
 }
 
 // =============================================================================
-// Security Helper Commands
-// =============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HelperProviderInfo {
-    name: String,
-    issuer: String,
-    #[serde(default)]
-    client_id: Option<String>,
-    #[serde(default)]
-    client_secret: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HelperInfo {
-    name: String,
-    version: String,
-    auth_mode: String,
-    #[serde(default)]
-    providers: Option<Vec<HelperProviderInfo>>,
-    supported_ecus: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HelperResult {
-    success: bool,
-    key: Option<String>,
-    error: Option<String>,
-}
-
-#[tauri::command]
-async fn set_security_helper(
-    state: State<'_, AppState>,
-    url: String,
-    token: String,
-) -> Result<(), String> {
-    *state.helper_url.lock().unwrap() = Some(url);
-    *state.helper_token.lock().unwrap() = Some(token);
-    Ok(())
-}
-
-#[tauri::command]
-async fn security_helper_info(state: State<'_, AppState>) -> Result<HelperInfo, String> {
-    let url = state
-        .helper_url
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Security helper not configured".to_string())?;
-
-    let resp = state
-        .http_client
-        .get(format!("{}/info", url.trim_end_matches('/')))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach helper: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Helper returned status {}", resp.status()));
-    }
-
-    resp.json::<HelperInfo>()
-        .await
-        .map_err(|e| format!("Invalid helper response: {}", e))
-}
-
-#[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri command: params bound by name from JS.
-async fn security_helper_calculate(
-    state: State<'_, AppState>,
-    seed: String,
-    level: u8,
-    component_id: String,
-    vin: Option<String>,
-    logical_address: Option<String>,
-    part_number: Option<String>,
-    hw_version: Option<String>,
-    sw_version: Option<String>,
-    supplier: Option<String>,
-) -> Result<HelperResult, String> {
-    let url = state
-        .helper_url
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Security helper not configured".to_string())?;
-
-    let token = state
-        .helper_token
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Security helper token not set".to_string())?;
-
-    let body = serde_json::json!({
-        "seed": seed,
-        "level": level,
-        "vehicle": { "vin": vin },
-        "ecu": {
-            "component_id": component_id,
-            "logical_address": logical_address,
-            "part_number": part_number,
-            "hw_version": hw_version,
-            "sw_version": sw_version,
-            "supplier": supplier,
-        },
-    });
-
-    let resp = state
-        .http_client
-        .post(format!("{}/calculate", url.trim_end_matches('/')))
-        .header("Authorization", format!("Bearer {}", token))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach helper: {}", e))?;
-
-    resp.json::<HelperResult>()
-        .await
-        .map_err(|e| format!("Invalid helper response: {}", e))
-}
-
-// =============================================================================
 // OIDC Login Flow
 // =============================================================================
 
@@ -1464,40 +1270,11 @@ struct CallbackParams {
 #[tauri::command]
 async fn oidc_login(
     state: State<'_, AppState>,
-    provider_name: String,
+    issuer: String,
+    client_id: String,
+    client_secret: Option<String>,
 ) -> Result<OidcLoginResult, String> {
-    // 1. Fetch /info from helper to get provider details
-    let url = state
-        .helper_url
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "Security helper not configured".to_string())?;
-
-    let info = state
-        .http_client
-        .get(format!("{}/info", url.trim_end_matches('/')))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach helper: {}", e))?
-        .json::<HelperInfo>()
-        .await
-        .map_err(|e| format!("Invalid helper response: {}", e))?;
-
-    let provider = info
-        .providers
-        .as_ref()
-        .and_then(|ps| ps.iter().find(|p| p.name == provider_name))
-        .ok_or_else(|| format!("Provider '{}' not found in helper /info", provider_name))?;
-
-    let client_id = provider
-        .client_id
-        .clone()
-        .ok_or_else(|| format!("Provider '{}' did not expose client_id", provider_name))?;
-    let client_secret = provider.client_secret.clone();
-    let issuer = provider.issuer.clone();
-
-    // 2. Fetch OIDC discovery document
+    // 1. Fetch OIDC discovery document from the configured issuer
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
@@ -1512,18 +1289,18 @@ async fn oidc_login(
         .await
         .map_err(|e| format!("Failed to parse OIDC discovery: {}", e))?;
 
-    // 3. Generate PKCE code_verifier and code_challenge (S256)
+    // 2. Generate PKCE code_verifier and code_challenge (S256)
     use sha2::Digest;
     let verifier_bytes: [u8; 32] = rand::random();
     let code_verifier = base64_url_encode(&verifier_bytes);
     let challenge_hash = sha2::Sha256::digest(code_verifier.as_bytes());
     let code_challenge = base64_url_encode(&challenge_hash);
 
-    // 4. Generate random state nonce
+    // 3. Generate random state nonce
     let state_bytes: [u8; 16] = rand::random();
     let state_nonce = hex::encode(state_bytes);
 
-    // 5. Bind temporary localhost callback server (OS picks free port)
+    // 4. Bind temporary localhost callback server (OS picks free port)
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("Failed to bind callback listener: {}", e))?;
@@ -1533,7 +1310,7 @@ async fn oidc_login(
         .port();
     let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
 
-    // 6. Construct authorization URL
+    // 5. Construct authorization URL
     let auth_url = format!(
         "{}?{}",
         discovery.authorization_endpoint,
@@ -1548,10 +1325,10 @@ async fn oidc_login(
             .finish()
     );
 
-    // 7. Open browser
+    // 6. Open browser
     open::that(&auth_url).map_err(|e| format!("Failed to open browser: {}", e))?;
 
-    // 8. Wait for callback (with 120s timeout)
+    // 7. Wait for callback (with 120s timeout)
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<(String, String), String>>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1602,14 +1379,14 @@ async fn oidc_login(
 
     let (auth_code, returned_state) = callback_result;
 
-    // 9. Validate state
+    // 8. Validate state
     if returned_state != state_nonce {
         let _ = shutdown_tx.send(());
         let _ = server_handle.await;
         return Err("OIDC state mismatch — possible CSRF attack".to_string());
     }
 
-    // 10. Exchange code for tokens
+    // 9. Exchange code for tokens
     let token_body = {
         let mut s = url::form_urlencoded::Serializer::new(String::new());
         s.append_pair("grant_type", "authorization_code")
@@ -1639,26 +1416,25 @@ async fn oidc_login(
         .id_token
         .ok_or_else(|| "Token response did not contain id_token".to_string())?;
 
-    // 11. Decode claims for display (unverified — helper validates when used)
+    // 10. Decode claims for display (unverified — the SOVD server validates
+    //     the token when it is used)
     let claims = decode_jwt_claims_unverified(&id_token).unwrap_or(IdTokenClaims {
         sub: "unknown".to_string(),
         email: None,
         name: None,
     });
 
-    // 12. Store token in app state
-    *state.helper_token.lock().unwrap() = Some(id_token.clone());
-
-    // 13. Shut down temp server
+    // 11. Shut down temp server
     let _ = shutdown_tx.send(());
     let _ = server_handle.await;
 
-    // 14. Return result to frontend
+    // 12. Return result to frontend (the frontend keeps the token as the
+    //     bearer credential for SOVD requests)
     Ok(OidcLoginResult {
         token: id_token,
         email: claims.email,
         name: claims.name,
-        provider: provider_name,
+        provider: issuer,
     })
 }
 
@@ -1703,12 +1479,7 @@ pub fn run() {
             get_session,
             set_session,
             get_security,
-            request_security_seed,
-            send_security_key,
-            // Security Helper
-            set_security_helper,
-            security_helper_info,
-            security_helper_calculate,
+            // Auth (OIDC)
             oidc_login,
             // Flash/Software Update
             flash_init,

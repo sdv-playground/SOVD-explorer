@@ -1,15 +1,15 @@
 # SOVD Explorer Index
 
-Tauri desktop GUI for browsing SOVD server state, diagnostics, firmware update flows, security helper, and OIDC login.
+Tauri desktop GUI for browsing SOVD server state, diagnostics, firmware update flows, and OIDC login.
 
 ## Where to look
 
 - `ARCHITECTURE.md` — authoritative module map, command list, state model, and known monolith shape.
 - `package.json` — frontend scripts and dependencies.
 - `src/App.tsx` — single-file React UI and state orchestration.
-- `src-tauri/src/lib.rs` — Tauri command surface, SOVD client, helper and OIDC backend.
+- `src-tauri/src/lib.rs` — Tauri command surface, SOVD client, OIDC backend.
 - `docs/standard-dids-and-security.md` — DID/security reference notes.
-- `simulation/`, `scripts/` — helper data and setup scripts.
+- `scripts/` — setup scripts.
 
 ## Essential commands
 
@@ -29,7 +29,7 @@ Finding commands:
 
 ```bash
 rg --files -g 'package.json' -g 'Cargo.toml' -g 'ARCHITECTURE.md' -g 'docs/**'
-rg -n "invoke\(|tauri::command|security_helper|oidc|FlashClient|gateway|/updates" src src-tauri docs ARCHITECTURE.md
+rg -n "invoke\(|tauri::command|oidc|FlashClient|gateway|/updates" src src-tauri docs ARCHITECTURE.md
 ```
 
 ## Stack
@@ -46,7 +46,7 @@ rg -n "invoke\(|tauri::command|security_helper|oidc|FlashClient|gateway|/updates
 ## Gotchas
 
 - `src/App.tsx` and `src-tauri/src/lib.rs` are large single-file modules; search before editing.
-- Helper auth may be static or OIDC; stale JWT fallback is intentional.
+- UDS security access is server-side (unlocked transparently for JWT-authorized requests); the UI's security state is display-only.
 
 ## Missing docs/specs to watch
 

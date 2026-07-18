@@ -1,23 +1,25 @@
 # Architecture: SOVD Explorer
 
-> Refreshed 2026-06-07 — flash-driving migrated to the SOVDd `/updates` wire (ISO 17978-3
-> §7.18); `read_parameter_raw` dropped (raw bytes ride the normal read). The Tauri 2 /
-> React stack and most views are unchanged.
+> Refreshed 2026-07-18 — the offboard SOVD-security-helper integration is retired: SOVD
+> servers unlock UDS SecurityAccess themselves, server-side, when a request carries a
+> valid JWT, so the client-side seed→key choreography, the helper settings, and the
+> helper HTTP client are gone. OIDC sign-in stays (issuer + client id configured in
+> Settings). Flash-driving rides the SOVDd `/updates` wire (ISO 17978-3 §7.18).
 
 ## Overview
 
-SOVD Explorer is a desktop GUI for interacting with automotive ECUs via the **SOVD (Service-Oriented Vehicle Diagnostics)** protocol. It connects to a SOVDd server, discovers vehicle components (ECUs and gateways), and provides a tabbed interface for reading/writing parameters, viewing faults, executing operations, controlling I/O, performing firmware updates, and managing diagnostic sessions/security access. ECUs behind gateways are accessed via spec-compliant sub-entity routing (SOVD §6.5).
+SOVD Explorer is a desktop GUI for interacting with automotive ECUs via the **SOVD (Service-Oriented Vehicle Diagnostics)** protocol. It connects to a SOVDd server, discovers vehicle components (ECUs and gateways), and provides a tabbed interface for reading/writing parameters, viewing faults, executing operations, controlling I/O, performing firmware updates, and managing diagnostic sessions. UDS security access is the server's concern — the UI only displays the server-reported security state. ECUs behind gateways are accessed via spec-compliant sub-entity routing (SOVD §6.5).
 
 **Stack:** Tauri 2 (Rust backend + React/TypeScript frontend), Vite bundler, local `sovd-client` and `sovd-uds` crates for SOVD protocol communication.
 
 | Language   | Files | Code Lines |
 |------------|-------|------------|
-| Rust       | 4     | ~1,675     |
-| TSX        | 2     | ~3,312     |
-| CSS        | 2     | ~2,004     |
+| Rust       | 4     | ~1,500     |
+| TSX        | 2     | ~3,150     |
+| CSS        | 2     | ~2,000     |
 | TypeScript | 2     | 19         |
 | Other      | 22    | ~9,100     |
-| **Total**  | **32**| **~16,600**|
+| **Total**  | **32**| **~15,800**|
 
 ## Project Structure
 
@@ -36,7 +38,6 @@ SOVD-explorer/
 │   ├── Cargo.toml               # Rust dependencies
 │   ├── tauri.conf.json           # Tauri window config, build settings
 │   └── capabilities/default.json # Tauri permissions (core + shell:open)
-├── simulation/                   # Test firmware binaries & package creation tools
 ├── scripts/                      # Setup and prerequisite installation
 └── docs/                         # Protocol documentation
 ```
@@ -58,25 +59,23 @@ graph LR
 
     subgraph External["External Services"]
         SOVDd["SOVDd Server<br/>(SOVD protocol)"]
-        Helper["Security Helper<br/>(HTTP API)"]
         IdP["OIDC Identity Provider<br/>(Google, Azure, etc.)"]
     end
 
     App -- "invoke() IPC" --> Commands
     Commands -- "sovd-client" --> SOVDd
-    Commands -- "reqwest HTTP" --> Helper
     Commands --> State
     OIDC -- "Authorization Code + PKCE" --> IdP
-    OIDC -- "id_token → helper_token" --> State
+    OIDC -- "id_token → frontend (SOVD bearer)" --> App
 ```
 
 ## Module Hierarchy
 
 The application is a **single-module monolith** — both frontend and backend are each contained in a single file.
 
-### Backend (`src-tauri/src/lib.rs` — ~1,675 lines)
+### Backend (`src-tauri/src/lib.rs` — ~1,500 lines)
 
-Flat structure: one `pub fn run()` entry point, ~41 Tauri command functions, ~20 response/helper structs, 1 `AppState` struct, 1 embedded axum callback server for OIDC.
+Flat structure: one `pub fn run()` entry point, 38 Tauri command functions, ~17 response structs, 1 `AppState` struct, 1 embedded axum callback server for OIDC.
 
 **AppState** (line 16):
 | Field | Type | Purpose |
@@ -86,11 +85,9 @@ Flat structure: one `pub fn run()` entry point, ~41 Tauri command functions, ~20
 | `flash_client` | `Mutex<Option<FlashClient>>` | Active flash session |
 | `current_flash_component` | `Mutex<Option<String>>` | ECU being flashed |
 | `current_flash_gateway` | `Mutex<Option<String>>` | Gateway id for an in-flight sub-entity flash — routes the identData (F189) installed-version read through the gateway |
-| `helper_url` | `Mutex<Option<String>>` | Security helper endpoint |
-| `helper_token` | `Mutex<Option<String>>` | Security helper auth token (static or OIDC JWT) |
-| `http_client` | `reqwest::Client` | Shared HTTP client for helper calls |
+| `http_client` | `reqwest::Client` | HTTP client for the OIDC flow (discovery + token exchange) |
 
-### Frontend (`src/App.tsx` — ~3,312 lines)
+### Frontend (`src/App.tsx` — ~3,150 lines)
 
 All components in one file:
 
@@ -107,14 +104,14 @@ graph TD
 
 | Component | Lines | Key Props | Purpose |
 |-----------|-------|-----------|---------|
-| `App` | 220–655 | — | Root: connection, sidebar tree, settings modal, OIDC sign-in, helper probe |
-| `ComponentDetails` | 671–1176 | `componentId, gatewayComponentId?, pathPrefix?, ensureHelper, allComponentIds` | Tab container: derives `apiComponentId` and `modeTarget` for gateway routing; fetches ECU info, session, security |
-| `DataTab` | 1198–1517 | `parameters, values, componentId, paramPrefix?, onWriteParameter, monitoring, previousValues` | Parameter read/write with search, monitoring, source column for gateway views |
-| `FaultsTab` | 1528–1567 | `faults, loading` | DTC list display |
-| `OperationsTab` | 1580–1723 | `componentId, session, security, paramPrefix?` | Start/stop/result for diagnostic operations |
-| `LogsTab` | 1733–1813 | — (uses LogContext) | Activity log table with filter, export, clear |
-| `IoControlTab` | 1849–2134 | `componentId, session, security, paramPrefix?` | Freeze/adjust/reset I/O controls with auto-refresh |
-| `SoftwareTab` | 2202–2978 | `componentId, gatewayComponentId?, modeTarget?, apiComponentId, session, onUpdateComplete, allComponentIds` | Firmware update: upload, flash, reset, commit/rollback; gateway-aware flash routing |
+| `App` | 233–607 | — | Root: connection, sidebar tree, settings modal, OIDC sign-in |
+| `ComponentDetails` | 622–1080 | `componentId, gatewayComponentId?, pathPrefix?, allComponentIds` | Tab container: derives `apiComponentId` and `modeTarget` for gateway routing; fetches ECU info, session, security state |
+| `DataTab` | 1102–1421 | `parameters, values, componentId, paramPrefix?, onWriteParameter, monitoring, previousValues` | Parameter read/write with search, monitoring, source column for gateway views |
+| `FaultsTab` | 1432–1473 | `faults, loading` | DTC list display |
+| `OperationsTab` | 1486–1639 | `componentId, session, security, paramPrefix?` | Start/stop/result for diagnostic operations |
+| `LogsTab` | 1645–1725 | — (uses LogContext) | Activity log table with filter, export, clear |
+| `IoControlTab` | 1761–2046 | `componentId, session, security, paramPrefix?` | Freeze/adjust/reset I/O controls with auto-refresh |
+| `SoftwareTab` | 2165–3149 | `componentId, gatewayComponentId?, modeTarget?, apiComponentId, session, onUpdateComplete, allComponentIds` | Firmware update: upload, flash, reset, commit/rollback; gateway-aware flash routing |
 
 ## Core Types
 
@@ -127,8 +124,6 @@ classDiagram
         +server_url: String
         +flash_client: Option~FlashClient~
         +current_flash_component: Option~String~
-        +helper_url: Option~String~
-        +helper_token: Option~String~
         +http_client: reqwest::Client
     }
 
@@ -146,7 +141,6 @@ classDiagram
     class SecurityInfo {
         +id: String
         +value: String
-        +seed: Option~String~
     }
 
     class UploadResult {
@@ -176,14 +170,6 @@ classDiagram
         +message: Option~String~
     }
 
-    class HelperInfo {
-        +name: String
-        +version: String
-        +auth_mode: String
-        +providers: Option~Vec~HelperProviderInfo~~
-        +supported_ecus: Vec~String~
-    }
-
     class OidcLoginResult {
         +token: String
         +email: Option~String~
@@ -202,7 +188,6 @@ classDiagram
 | `FlashPhase` | 11 states: `idle → uploading → ... → committed/rolledback` | SoftwareTab state machine |
 | `ActivationInfo` | `supports_rollback, state, active_version, previous_version` | Commit/rollback UI |
 | `ExistingTransfer` | `transfer_id, state, error, component_id` | Cross-ECU transfer warnings |
-| `HelperProviderInfo` | `name, issuer, client_id?` | OIDC provider buttons in settings |
 | `OidcLoginResult` | `token, email, name, provider` | OIDC sign-in result |
 | `LogEntry` | `timestamp, type, component, action, details, success` | Activity logging |
 
@@ -306,14 +291,11 @@ sequenceDiagram
     participant User
     participant App as Settings UI
     participant BE as Rust Backend
-    participant Helper as Security Helper
     participant IdP as OIDC Provider
     participant Browser
 
-    User->>App: Click "Sign in with {provider}"
-    App->>BE: oidc_login(providerName)
-    BE->>Helper: GET /info
-    Helper-->>BE: HelperInfo{providers: [{issuer, client_id}]}
+    User->>App: Configure issuer + client id, click "Sign in"
+    App->>BE: oidc_login(issuer, clientId)
 
     BE->>IdP: GET /.well-known/openid-configuration
     IdP-->>BE: {authorization_endpoint, token_endpoint}
@@ -329,44 +311,19 @@ sequenceDiagram
     IdP-->>BE: {id_token: "jwt..."}
 
     BE->>BE: Decode JWT claims (unverified)
-    BE->>BE: Store id_token as helper_token
 
     BE-->>App: OidcLoginResult{token, email, name, provider}
-    App->>App: Show signed-in user, re-probe helper
+    App->>App: Persist token (SOVD bearer credential), show signed-in user
 ```
 
-### Security Unlock Flow
+### Security State (display-only)
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant CD as ComponentDetails
-    participant BE as Rust Backend
-    participant Helper as Security Helper
-    participant SOVDd
-
-    User->>CD: Select "Unlocked" in security dropdown
-    CD->>CD: Check session ≥ Extended
-    CD->>CD: ensureHelper() (lazy connect + auth check)
-
-    CD->>BE: request_security_seed(componentId, level, target?)
-    BE->>SOVDd: POST /components/{id}/modes/security (or sub-entity route)
-    SOVDd-->>BE: seed bytes
-    BE-->>CD: SecurityInfo{seed: "0x01 0x02..."}
-
-    CD->>CD: Parse seed hex, gather ECU info (vin, part_number, etc.)
-    CD->>BE: security_helper_calculate(seed, level, componentId, vin?, ...)
-    BE->>Helper: POST /calculate {seed, level, ecu: {component_id, ...}}
-    Helper-->>BE: {success, key: "abcd1234"}
-    BE-->>CD: HelperResult{key}
-
-    CD->>BE: send_security_key(componentId, level, key, target?)
-    BE->>SOVDd: POST /components/{id}/modes/security
-    SOVDd-->>BE: OK
-    BE-->>CD: SecurityInfo
-
-    CD->>CD: fetchModes() → security = "unlocked"
-```
+UDS SecurityAccess is no longer a client concern: the SOVD server unlocks ECUs
+transparently, server-side, when a request carries a valid JWT (the retired
+offboard SOVD-security-helper and its client-driven seed→key choreography are
+gone). The UI only calls `get_security` and renders the server-reported state
+as a read-only badge in the component header, plus prerequisite pills on
+operations and I/O controls.
 
 ## State Management
 
@@ -380,7 +337,7 @@ sequenceDiagram
 | `selectedComponent` | `string \| null` | App | ComponentDetails mount | Sidebar click |
 | `gatewayContext` | `string \| null` | App | ComponentDetails (gateway routing) | Sidebar click |
 | `selectedPathPrefix` | `string \| null` | App | ComponentDetails (sub-entity path) | Sidebar click |
-| `helperInfo` | `HelperInfo \| null` | App | Settings UI (auth_mode, providers) | probeHelper, ensureHelper |
+| `oidcIssuer` / `oidcClientId` | `string` | App | Settings UI, oidcLogin | User input (persisted) |
 | `oidcUser` | `{email, provider} \| null` | App | Settings UI (signed-in indicator) | oidcLogin, oidcSignOut |
 | `LogContext` | `{logs, addLog, clearLogs}` | App (Context) | LogsTab, all tabs | All tabs via useLog() |
 
@@ -389,8 +346,8 @@ sequenceDiagram
 | State | Type | Reads | Writes |
 |-------|------|-------|--------|
 | `session` | `SessionMode` | All tabs (prerequisite checks) | get_session, set_session (with `target` for sub-entities) |
-| `security` | `SecurityState` | Operations, IO tabs | get_security, unlock flow |
-| `ecuInfo` | `Record<string,string>` | ECU info grid, security unlock (vin, part_number, etc.) | get_ecu_info |
+| `security` | `SecurityState` | Header badge, Operations, IO tabs (display-only) | get_security |
+| `ecuInfo` | `Record<string,string>` | ECU info grid | get_ecu_info |
 | `apiComponentId` | derived | All IPC calls | `= gatewayComponentId \|\| componentId` |
 | `modeTarget` | derived | Session/security/flash routing | `= pathPrefix` (when sub-entity) |
 | `paramPrefix` | derived | Parameter/fault/operation filtering | `= pathPrefix + "/"` (when sub-entity) |
@@ -419,13 +376,14 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 | `disconnect` | — | `()` | Clear client from AppState |
 | `get_connection_status` | — | `ConnectionStatus` | Check if client exists |
 
-### Components (4 commands)
+### Components (5 commands)
 | Command | Parameters | Returns | Description |
 |---------|-----------|---------|-------------|
 | `list_components` | — | `Vec<Component>` | List all ECUs and gateways |
 | `get_component` | `component_id` | `Component` | Get single component details |
 | `list_apps` | `component_id` | `Vec<AppInfo>` | List sub-entities (apps) under a gateway |
 | `list_sub_entity_apps` | `component_id, app_id` | `Vec<AppInfo>` | List apps under a nested sub-entity |
+| `get_app_detail` | `component_id, app_id` | `AppInfo` | Get sub-entity detail (capabilities) through the gateway |
 
 ### Data / Parameters (4 commands)
 | Command | Parameters | Returns | Description |
@@ -453,22 +411,17 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 | `list_io_controls` | `component_id` | `Vec<IoControlInfo>` | List I/O control items |
 | `io_control` | `component_id, data_id, action, value?` | `IoControlResponse` | Freeze/adjust/reset |
 
-### Session & Security (5 commands)
+### Session & Security (3 commands)
 | Command | Parameters | Returns | Description |
 |---------|-----------|---------|-------------|
 | `get_session` | `component_id, target?` | `SessionInfo` | Get current session mode. `target` routes through gateway to sub-entity. |
 | `set_session` | `component_id, session, target?` | `SessionInfo` | Switch session. `target` routes through gateway. |
-| `get_security` | `component_id, target?` | `SecurityInfo` | Get security lock state |
-| `request_security_seed` | `component_id, level, target?` | `SecurityInfo` | Request seed for security access |
-| `send_security_key` | `component_id, level, key, target?` | `SecurityInfo` | Send computed key to unlock |
+| `get_security` | `component_id, target?` | `SecurityInfo` | Get server-reported security state (display-only — the server unlocks UDS SecurityAccess itself for authorized requests) |
 
-### Security Helper (4 commands)
+### Auth (1 command)
 | Command | Parameters | Returns | Description |
 |---------|-----------|---------|-------------|
-| `set_security_helper` | `url, token` | `()` | Configure helper endpoint + auth token |
-| `security_helper_info` | — | `HelperInfo` | Get helper name, version, auth_mode, providers, supported_ecus |
-| `security_helper_calculate` | `seed, level, component_id, vin?, logical_address?, part_number?, hw_version?, sw_version?, supplier?` | `HelperResult` | Compute security key from seed with ECU context |
-| `oidc_login` | `provider_name` | `OidcLoginResult` | Full OIDC Authorization Code + PKCE flow; opens browser, receives callback, exchanges for id_token |
+| `oidc_login` | `issuer, client_id, client_secret?` | `OidcLoginResult` | Full OIDC Authorization Code + PKCE flow; opens browser, receives callback, exchanges for id_token |
 
 ### Flash / Software Update (14 commands)
 | Command | Parameters | Returns | Description |
@@ -488,12 +441,17 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 | `flash_commit` | — | `CommitRollbackResult` | Make activated firmware permanent |
 | `flash_rollback` | — | `CommitRollbackResult` | Revert to previous firmware |
 
+### Status (1 command)
+| Command | Parameters | Returns | Description |
+|---------|-----------|---------|-------------|
+| `read_status` | `component_id` | `RuntimeStatus` | Converged runtime status from `GET /{entity}/status` (ISO 17978-3 §7.19.2): ready + `x-sumo-runtime` passthrough |
+
 ### Logging (1 command)
 | Command | Parameters | Returns | Description |
 |---------|-----------|---------|-------------|
 | `export_logs` | `logs, format` | `()` | Save logs via native file dialog (JSON/CSV/TXT) |
 
-**Total: ~41 Tauri commands**
+**Total: 38 Tauri commands**
 
 ## External Dependencies
 
@@ -502,12 +460,12 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 |-------|---------|---------|
 | `tauri` | 2.x | Desktop app framework, IPC bridge |
 | `sovd-client` | local | SOVD protocol client (HTTP-based diagnostics) |
-| `sovd-uds` | local | UDS types (SessionType, SecurityLevel, standard DIDs) |
-| `reqwest` | 0.12 | HTTP client for security helper |
+| `sovd-uds` | local | UDS standard DID catalog |
+| `reqwest` | 0.12 | HTTP client for the OIDC flow (discovery + token exchange) |
 | `serde` / `serde_json` | 1.x | JSON serialization for IPC |
 | `tokio` | 1.x | Async runtime (multi-thread, net, time) |
 | `rfd` | 0.15 | Native file dialogs (log export) |
-| `hex` | 0.4 | Hex encoding for security keys |
+| `hex` | 0.4 | Hex encoding (OIDC state nonce) |
 | `chrono` | 0.4 | Timestamp formatting for logs |
 | `axum` | 0.7 | Embedded HTTP server for OIDC callback |
 | `sha2` | 0.10 | SHA-256 for PKCE code challenge |
@@ -527,7 +485,7 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 
 1. **Single-file architecture**: Both frontend (`App.tsx`, ~3,000 lines) and backend (`lib.rs`, ~1,500 lines) are monolithic single files. This simplifies navigation and grep-ability but would benefit from splitting if the project grows further.
 
-2. **Mutex<Option<T>> pattern**: Backend state uses `Mutex<Option<T>>` for nullable shared state. The `get_client()` helper extracts and clones the client, returning an error if not connected. `SovdClient` and `FlashClient` are `Clone`, so commands hold independent copies.
+2. **Mutex<Option<T>> pattern**: Backend state uses `Mutex<Option<T>>` for nullable shared state. The `get_client()` function extracts and clones the client, returning an error if not connected. `SovdClient` and `FlashClient` are `Clone`, so commands hold independent copies.
 
 3. **Polling over WebSockets**: Flash progress uses client-side polling (500ms–3s intervals) rather than server-push. This matches the SOVD protocol's REST nature.
 
@@ -554,17 +512,15 @@ Any phase can transition to `error`. Terminal phases (`complete`, `committed`, `
 
 6. **Cross-ECU transfer detection**: SoftwareTab checks ALL ECUs for existing transfers by iterating `allComponentIds`, calling `flash_init` + `flash_list_transfers` for each, then re-initializing for the current component.
 
-7. **Security helper v2 API**: The helper now reports `auth_mode` ("static" or "oidc") and `supported_ecus`. The `calculate` endpoint accepts structured ECU context (`component_id`, `vin`, `part_number`, etc.) instead of a generic `ecu_type`/`algorithm` pair.
+7. **Server-side UDS unlock**: The offboard SOVD-security-helper is retired. The SOVD server unlocks UDS SecurityAccess itself for requests that carry a valid JWT, so the client has no seed/key path — `get_security` is display-only and the header shows a read-only `security-badge`.
 
-8. **OIDC login with PKCE**: For helpers in `oidc` auth mode, the backend runs a full Authorization Code + PKCE flow:
-   - Fetches provider config from helper `/info`
+8. **OIDC login with PKCE**: The backend runs a full Authorization Code + PKCE flow against the issuer + client id configured in Settings:
    - Discovers OIDC endpoints via `.well-known/openid-configuration`
    - Generates PKCE verifier (SHA-256, S256 method) and state nonce
    - Binds a temporary axum server on `127.0.0.1:0` for the callback
    - Opens the browser to the authorization URL
    - Exchanges the auth code for an `id_token` (JWT)
-   - Stores the JWT as the helper Bearer token
-   - Falls back cleanly: if helper switches to `static` mode and a stale JWT is stored, `ensureHelper` resets to the default static token
+   - Returns the JWT to the frontend, which persists it as the SOVD bearer credential
 
 9. **Two-phase commit for firmware**: ECUs with rollback support enter `AwaitingReset → Activated → Commit/Rollback`. A background `useEffect` poll (3s interval) detects state transitions, handling ECU offline periods (reboot) gracefully.
 
@@ -597,7 +553,7 @@ cd sovd-explorer
 8. Add session/security display in header (`get_session`, `get_security` with `target` parameter)
 
 **Phase 3 — Write & Control**
-9. Implement `write_parameter`, `set_session`, security access commands (all with `target` for sub-entities)
+9. Implement `write_parameter`, `set_session` (all with `target` for sub-entities)
 10. Add inline parameter editing to `DataTab`
 11. Build `OperationsTab` with start/stop/result (filtered by `paramPrefix`)
 12. Build `IoControlTab` with freeze/adjust/reset, auto-refresh polling
@@ -611,16 +567,14 @@ cd sovd-explorer
 18. Implement background activation polling with `useEffect`
 19. Add cross-ECU transfer detection via `allComponentIds`
 
-**Phase 5 — Security Helper & OIDC**
-20. Add helper fields to `AppState`, implement `set_security_helper`, `security_helper_info`, `security_helper_calculate` (v2 API with ECU context)
-21. Build security unlock flow in `ComponentDetails` (seed → helper with ECU info → key)
-22. Implement `oidc_login` with axum callback server, PKCE, JWT extraction
-23. Build OIDC sign-in UI in settings (provider buttons vs static token, auto-detection via `auth_mode`)
+**Phase 5 — OIDC Sign-in**
+20. Implement `oidc_login` with axum callback server, PKCE, JWT extraction (issuer + client id passed in from the frontend)
+21. Build OIDC sign-in UI in settings (issuer/client id fields, signed-in indicator, sign out)
 
 **Phase 6 — Logging**
-24. Create `LogContext` with `addLog` function
-25. Build `LogsTab` with filter, export (JSON/CSV/TXT)
-26. Implement `export_logs` with `rfd` file dialog
+22. Create `LogContext` with `addLog` function
+23. Build `LogsTab` with filter, export (JSON/CSV/TXT)
+24. Implement `export_logs` with `rfd` file dialog
 
 ### 4. Key Implementation Notes
 
@@ -630,5 +584,4 @@ cd sovd-explorer
 - **Flash client lifetime**: Don't clear `flash_client` after ECU reset — it's needed for commit/rollback. Clear only after commit/rollback succeed.
 - **Transfer cleanup**: Track completed transfer IDs in a `useRef<Set<string>>` to prevent them from re-appearing in transfer warnings.
 - **OIDC callback server**: Binds to `127.0.0.1:0` (OS picks port), serves a single `/callback` route, auto-shuts down after receiving the auth code or after 120s timeout.
-- **JWT handling**: The id_token is decoded without signature verification (the helper validates it when used). Claims are extracted for display only.
-- **Helper mode fallback**: If `ensureHelper` detects `auth_mode === "static"` but the stored token looks like a JWT (contains dots), it resets to the default static token.
+- **JWT handling**: The id_token is decoded without signature verification (the SOVD server validates it when used). Claims are extracted for display only.

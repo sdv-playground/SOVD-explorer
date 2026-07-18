@@ -139,7 +139,6 @@ interface SessionInfo {
 interface SecurityInfo {
   id: string;
   value: string;
-  seed?: string;
 }
 
 // =============================================================================
@@ -200,14 +199,8 @@ const useLog = () => {
 };
 
 // =============================================================================
-// Security Helper Types
+// OIDC Login Types
 // =============================================================================
-
-interface HelperProviderInfo {
-  name: string;
-  issuer: string;
-  client_id?: string;
-}
 
 interface OidcLoginResult {
   token: string;
@@ -216,22 +209,8 @@ interface OidcLoginResult {
   provider: string;
 }
 
-interface HelperInfo {
-  name: string;
-  version: string;
-  auth_mode: string;
-  providers?: HelperProviderInfo[];
-  supported_ecus: string[];
-}
-
-interface HelperResult {
-  success: boolean;
-  key?: string;
-  error?: string;
-}
-
 // =============================================================================
-// Helper Functions
+// Utility Functions
 // =============================================================================
 
 function hexToAscii(hex: string): string {
@@ -264,13 +243,11 @@ function App() {
   // Log state
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
-  // Security Helper state (top-level, same as SOVD server)
-  const [helperUrl, setHelperUrl] = useState<string>(() => localStorage.getItem("sovd_helper_url") || "http://localhost:9100");
-  const [helperToken, setHelperToken] = useState<string>(() => localStorage.getItem("sovd_helper_token") || "dev-secret-123");
-  const [helperConnected, setHelperConnected] = useState(false);
-  const [helperInfo, setHelperInfo] = useState<HelperInfo | null>(null);
-
-  // OIDC login state
+  // OIDC login state — the signed-in JWT authorizes SOVD requests; UDS
+  // security access is unlocked transparently server-side for authorized
+  // requests (no client-side seed/key flow).
+  const [oidcIssuer, setOidcIssuer] = useState<string>(() => localStorage.getItem("sovd_oidc_issuer") || "");
+  const [oidcClientId, setOidcClientId] = useState<string>(() => localStorage.getItem("sovd_oidc_client_id") || "");
   const [oidcUser, setOidcUser] = useState<{ email: string; provider: string } | null>(null);
   const [oidcLoggingIn, setOidcLoggingIn] = useState(false);
 
@@ -452,93 +429,35 @@ function App() {
     );
   };
 
-  // Probe helper to discover its auth_mode without requiring a token
-  // Probe helper to discover its auth_mode. Sets helperInfo for UI rendering
-  // but does NOT mark helperConnected — ensureHelper handles that with the real token.
-  const probeHelper = useCallback(async () => {
-    try {
-      // Temporarily set URL so security_helper_info can reach it, but use
-      // the real token so we don't clobber backend state for static mode.
-      await invoke("set_security_helper", { url: helperUrl, token: helperToken });
-      const info = await invoke<HelperInfo>("security_helper_info");
-      setHelperInfo(info);
-      setHelperConnected(false); // force ensureHelper to re-run with proper token
-      localStorage.setItem("sovd_helper_url", helperUrl);
-    } catch (e) {
-      setHelperInfo(null);
-      setHelperConnected(false);
-      setError(`Helper probe failed: ${e}`);
-    }
-  }, [helperUrl, helperToken]);
-
-  // OIDC login — launches browser-based sign-in flow
-  const oidcLogin = useCallback(async (providerName: string) => {
+  // OIDC login — launches browser-based sign-in flow against the configured
+  // issuer; the resulting id_token is kept as the SOVD bearer credential.
+  const oidcLogin = useCallback(async () => {
     setOidcLoggingIn(true);
     setError(null);
     try {
-      // Set helper URL (token empty — will be set by oidc_login command)
-      await invoke("set_security_helper", { url: helperUrl, token: "" });
-      const result = await invoke<OidcLoginResult>("oidc_login", { providerName });
-      // Store the returned token
-      setHelperToken(result.token);
-      localStorage.setItem("sovd_helper_token", result.token);
-      localStorage.setItem("sovd_helper_url", helperUrl);
+      const result = await invoke<OidcLoginResult>("oidc_login", {
+        issuer: oidcIssuer,
+        clientId: oidcClientId,
+      });
+      localStorage.setItem("sovd_auth_token", result.token);
+      localStorage.setItem("sovd_oidc_issuer", oidcIssuer);
+      localStorage.setItem("sovd_oidc_client_id", oidcClientId);
       setOidcUser({
         email: result.email || result.provider,
         provider: result.provider,
       });
-      // Re-probe helper to confirm connection with the new token
-      setHelperConnected(false);
-      setHelperInfo(null);
-      await invoke("set_security_helper", { url: helperUrl, token: result.token });
-      const info = await invoke<HelperInfo>("security_helper_info");
-      setHelperInfo(info);
-      setHelperConnected(true);
     } catch (e) {
       setError(`OIDC login failed: ${e}`);
     } finally {
       setOidcLoggingIn(false);
     }
-  }, [helperUrl]);
+  }, [oidcIssuer, oidcClientId]);
 
   // OIDC sign out — clear token and user state
   const oidcSignOut = useCallback(() => {
     setOidcUser(null);
-    setHelperToken("");
-    setHelperConnected(false);
-    setHelperInfo(null);
-    localStorage.removeItem("sovd_helper_token");
+    localStorage.removeItem("sovd_auth_token");
   }, []);
-
-  // Connect to helper on demand — called by SessionTab when unlock is needed.
-  // Returns the HelperInfo if successful, throws on failure.
-  const ensureHelper = useCallback(async (): Promise<HelperInfo> => {
-    if (helperConnected && helperInfo) return helperInfo;
-
-    await invoke("set_security_helper", { url: helperUrl, token: helperToken });
-    const info = await invoke<HelperInfo>("security_helper_info");
-    setHelperInfo(info);
-
-    // If OIDC mode and no token stored, prompt the user to sign in
-    if (info.auth_mode === "oidc" && !helperToken) {
-      setSettingsOpen(true);
-      throw new Error("OIDC authentication required — please sign in via Settings");
-    }
-
-    // If helper switched to static mode but we have a stale OIDC JWT, reset to default
-    if (info.auth_mode === "static" && helperToken.includes(".")) {
-      const defaultToken = "dev-secret-123";
-      setHelperToken(defaultToken);
-      setOidcUser(null);
-      localStorage.setItem("sovd_helper_token", defaultToken);
-      await invoke("set_security_helper", { url: helperUrl, token: defaultToken });
-    }
-
-    setHelperConnected(true);
-    localStorage.setItem("sovd_helper_url", helperUrl);
-    localStorage.setItem("sovd_helper_token", helperToken);
-    return info;
-  }, [helperUrl, helperToken, helperConnected, helperInfo]);
 
   const toggleSettings = () => {
     setSettingsOpen(prev => {
@@ -601,69 +520,48 @@ function App() {
                   </label>
                 </div>
                 <div className="settings-group">
-                  <label className="settings-label">Security Helper</label>
+                  <label className="settings-label">Authentication (OIDC)</label>
                   <div className="settings-row">
                     <input
                       type="text"
-                      value={helperUrl}
-                      onChange={(e) => { setHelperUrl(e.target.value); setHelperConnected(false); setHelperInfo(null); setOidcUser(null); }}
-                      placeholder="Helper URL"
+                      value={oidcIssuer}
+                      onChange={(e) => { setOidcIssuer(e.target.value); setOidcUser(null); }}
+                      placeholder="Issuer URL"
                       className="server-input"
                     />
-                    <button onClick={probeHelper} className="connect-btn" title="Check helper auth mode">
-                      Check
-                    </button>
+                    <input
+                      type="text"
+                      value={oidcClientId}
+                      onChange={(e) => { setOidcClientId(e.target.value); setOidcUser(null); }}
+                      placeholder="Client ID"
+                      className="server-input"
+                    />
                   </div>
-                  {helperInfo?.auth_mode === "oidc" && helperInfo.providers ? (
-                    // OIDC mode: show sign-in buttons instead of password field
-                    <div className="settings-row" style={{ flexDirection: "column", gap: "8px" }}>
-                      {oidcUser ? (
-                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                          <span className="helper-status-badge" title={`${helperInfo.name} v${helperInfo.version} (oidc)`}>
-                            Helper OK (oidc)
-                          </span>
-                          <span style={{ fontSize: "12px", opacity: 0.8 }}>
-                            {oidcUser.email} ({oidcUser.provider})
-                          </span>
-                          <button
-                            onClick={oidcSignOut}
-                            className="connect-btn"
-                            style={{ marginLeft: "auto", fontSize: "12px" }}
-                          >
-                            Sign out
-                          </button>
-                        </div>
-                      ) : (
-                        helperInfo.providers.map((p) => (
-                          <button
-                            key={p.name}
-                            onClick={() => oidcLogin(p.name)}
-                            className="connect-btn"
-                            disabled={oidcLoggingIn}
-                            style={{ width: "100%" }}
-                          >
-                            {oidcLoggingIn ? "Signing in..." : `Sign in with ${p.name}`}
-                          </button>
-                        ))
-                      )}
-                    </div>
-                  ) : (
-                    // Static mode or not yet probed: show token password field
-                    <div className="settings-row">
-                      <input
-                        type="password"
-                        value={helperToken}
-                        onChange={(e) => { setHelperToken(e.target.value); setHelperConnected(false); setHelperInfo(null); }}
-                        placeholder="Token"
-                        className="server-input"
-                      />
-                      {helperConnected && (
-                        <span className="helper-status-badge" title={helperInfo ? `${helperInfo.name} v${helperInfo.version} (${helperInfo.auth_mode})` : ""}>
-                          Helper OK ({helperInfo?.auth_mode || "?"})
+                  <div className="settings-row">
+                    {oidcUser ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", width: "100%" }}>
+                        <span style={{ fontSize: "12px", opacity: 0.8 }}>
+                          Signed in: {oidcUser.email} ({oidcUser.provider})
                         </span>
-                      )}
-                    </div>
-                  )}
+                        <button
+                          onClick={oidcSignOut}
+                          className="connect-btn"
+                          style={{ marginLeft: "auto", fontSize: "12px" }}
+                        >
+                          Sign out
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={oidcLogin}
+                        className="connect-btn"
+                        disabled={oidcLoggingIn || !oidcIssuer || !oidcClientId}
+                        style={{ width: "100%" }}
+                      >
+                        {oidcLoggingIn ? "Signing in..." : "Sign in"}
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -690,7 +588,6 @@ function App() {
                 componentId={selectedComponent}
                 gatewayComponentId={gatewayContext}
                 pathPrefix={selectedPathPrefix}
-                ensureHelper={ensureHelper}
                 allComponentIds={componentTree.flatMap(node =>
                   node.children.length > 0
                     ? node.children.map(c => c.component.id)
@@ -719,11 +616,10 @@ interface ComponentDetailsProps {
   gatewayComponentId?: string | null;
   /** Full path prefix from root gateway (e.g., "uds_gw/engine_ecu") */
   pathPrefix?: string | null;
-  ensureHelper: () => Promise<HelperInfo>;
   allComponentIds: string[];
 }
 
-function ComponentDetails({ componentId, gatewayComponentId, pathPrefix, ensureHelper, allComponentIds }: ComponentDetailsProps) {
+function ComponentDetails({ componentId, gatewayComponentId, pathPrefix, allComponentIds }: ComponentDetailsProps) {
   const { addLog } = useLog();
   // When viewing a sub-entity, route API calls through the parent gateway
   const apiComponentId = gatewayComponentId || componentId;
@@ -745,9 +641,6 @@ function ComponentDetails({ componentId, gatewayComponentId, pathPrefix, ensureH
   // Monitoring state
   const [monitoring, setMonitoring] = useState(false);
   const [refreshRate, setRefreshRate] = useState(500);
-
-  // Security toggle state
-  const [securityBusy, setSecurityBusy] = useState(false);
 
   // ECU Info state
   const [ecuInfo, setEcuInfo] = useState<Record<string, string>>({});
@@ -863,111 +756,6 @@ function ComponentDetails({ componentId, gatewayComponentId, pathPrefix, ensureH
     }
   };
 
-  // Change security state via dropdown
-  const changeSecurityState = useCallback(async (target: SecurityState) => {
-    if (target === security) return; // already in target state
-
-    setSecurityBusy(true);
-    setSessionError(null);
-
-    if (target === "unlocked") {
-      // Unlock: need extended/engineering session + helper
-      if (session === "default") {
-        setSessionError("Switch to Extended or Engineering session before unlocking");
-        setSecurityBusy(false);
-        return;
-      }
-      try {
-        const info = await ensureHelper();
-        if (!info.supported_ecus.includes(componentId)) {
-          throw new Error(`ECU '${componentId}' not supported by helper. Supported: ${info.supported_ecus.join(", ")}`);
-        }
-
-        const seedResult = await invoke<SecurityInfo>("request_security_seed", {
-          componentId: apiComponentId,
-          level: 1,
-          target: modeTarget,
-        });
-        if (!seedResult.seed) throw new Error("ECU returned empty seed");
-
-        const seedHex = seedResult.seed
-          .split(/\s+/)
-          .map((s) => {
-            const n = parseInt(s.replace(/^0x/i, ""), 16);
-            return isNaN(n) ? "" : n.toString(16).padStart(2, "0");
-          })
-          .join("");
-
-        const calcResult = await invoke<HelperResult>("security_helper_calculate", {
-          seed: seedHex,
-          level: 1,
-          componentId,
-          vin: ecuInfo.vin || null,
-          logicalAddress: null,
-          partNumber: ecuInfo.part_number || null,
-          hwVersion: ecuInfo.hw_version || null,
-          swVersion: ecuInfo.ecu_sw_version || null,
-          supplier: ecuInfo.supplier || null,
-        });
-        if (!calcResult.success || !calcResult.key) {
-          throw new Error(calcResult.error || "Helper returned no key");
-        }
-
-        await invoke<SecurityInfo>("send_security_key", {
-          componentId: apiComponentId,
-          level: 1,
-          key: calcResult.key,
-          target: modeTarget,
-        });
-
-        addLog({
-          type: "operation",
-          component: componentId,
-          action: "Security Unlock",
-          details: `${componentId} (via helper)`,
-          success: true,
-        });
-      } catch (e) {
-        setSessionError(`Unlock failed: ${e}`);
-        addLog({
-          type: "error",
-          component: componentId,
-          action: "Security Unlock",
-          details: String(e),
-          success: false,
-        });
-      }
-    } else {
-      // Lock: cycle session to default and back to re-lock security
-      const currentSession = session;
-      try {
-        await invoke<SessionInfo>("set_session", { componentId: apiComponentId, session: "default", target: modeTarget });
-        if (currentSession !== "default") {
-          await invoke<SessionInfo>("set_session", { componentId: apiComponentId, session: currentSession, target: modeTarget });
-        }
-        addLog({
-          type: "operation",
-          component: componentId,
-          action: "Security Lock",
-          details: `Re-locked (session cycled via default)`,
-          success: true,
-        });
-      } catch (e) {
-        setSessionError(`Lock failed: ${e}`);
-        addLog({
-          type: "error",
-          component: componentId,
-          action: "Security Lock",
-          details: String(e),
-          success: false,
-        });
-      }
-    }
-
-    await fetchModes();
-    setSecurityBusy(false);
-  }, [security, session, apiComponentId, ecuInfo, ensureHelper, fetchModes, addLog]);
-
   // Fetch parameter definitions
   const fetchParameterDefs = useCallback(async (): Promise<ParameterInfo[]> => {
     try {
@@ -1057,7 +845,7 @@ function ComponentDetails({ componentId, gatewayComponentId, pathPrefix, ensureH
       let faultList = await invoke<FaultInfo[]>("list_faults", { componentId: apiComponentId });
       if (paramPrefix) {
         // Post-F.6: FaultInfo lost its `id` field — derive the id from the
-        // `href` tail (or fall back to `code`) via the faultId helper.
+        // `href` tail (or fall back to `code`) via the faultId function.
         faultList = faultList.filter(f => faultId(f).startsWith(paramPrefix));
       }
       setFaults(faultList);
@@ -1185,15 +973,12 @@ function ComponentDetails({ componentId, gatewayComponentId, pathPrefix, ensureH
               ))}
             </select>
             {capabilities?.security !== false && (
-              <select
-                className={`security-select ${security}`}
-                value={security}
-                onChange={(e) => changeSecurityState(e.target.value as SecurityState)}
-                disabled={securityBusy}
+              <span
+                className={`security-badge ${security}`}
+                title="Server-reported security state — the SOVD server unlocks UDS security access itself for authorized requests"
               >
-                <option value="locked">Locked</option>
-                <option value="unlocked">Unlocked</option>
-              </select>
+                {security === "unlocked" ? "Unlocked" : "Locked"}
+              </span>
             )}
           </div>
         )}
