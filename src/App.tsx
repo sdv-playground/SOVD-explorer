@@ -2154,13 +2154,17 @@ interface ActivationInfo {
 // are the vendor x-sumo-runtime passthrough. admin_state is tri-state by
 // contract: "enabled"/"disabled" only on components that support
 // administrative disable, absent otherwise — absent means render no admin
-// badge and no toggle (never a dead control).
+// badge and no toggle (never a dead control). reboot_pending is true only
+// while a disabled component's application is still running (RT after an
+// erase — the M7 executes from SRAM until the node reboots); device-derived,
+// self-clears after the real reboot, absent-means-false on the wire.
 interface RuntimeStatus {
   ready: boolean | null;
   boot_id: number | null;
   hb_seq: number | null;
   boot_count: number | null;
   admin_state: string | null;
+  reboot_pending: boolean;
 }
 
 // Outcome of the x-sumo-admin-state op (§7.14 execution, flattened by the
@@ -2960,6 +2964,13 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
   const currentPhaseIndex = getPhaseIndex(phase);
   const isProcessing = phase !== PHASE.IDLE && phase !== PHASE.COMPLETE && phase !== PHASE.ERROR && phase !== PHASE.RESETTING && phase !== PHASE.ACTIVATED && phase !== PHASE.COMMITTED && phase !== PHASE.ROLLED_BACK;
 
+  // Erase armed but the application still runs (RT executes from SRAM until
+  // the node reboots). Persistent badge signal — the device clears
+  // reboot_pending after the real reboot and the regular status refresh
+  // picks that up.
+  const restartPending =
+    runtimeStatus?.admin_state === "disabled" && runtimeStatus.reboot_pending;
+
   return (
     <div className="software-tab">
       {/* Current Version Display */}
@@ -2978,13 +2989,23 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           </span>
           {/* Admin surface renders ONLY when the device reports admin_state
               (tri-state contract — never a dead badge or toggle). "disabled"
-              is amber, not red: intentionally stopped, not unhealthy. */}
+              is amber, not red: intentionally stopped, not unhealthy. While
+              reboot_pending rides along, the badge tightens to say the
+              disable hasn't fully landed yet. */}
           {runtimeStatus.admin_state != null && (
             <span
-              className={`admin-badge ${runtimeStatus.admin_state}`}
-              title="Administrative state"
+              className={`admin-badge ${runtimeStatus.admin_state}${
+                restartPending ? " restart-pending" : ""
+              }`}
+              title={
+                restartPending
+                  ? "erase armed — the component's application keeps running until the node restarts"
+                  : "Administrative state"
+              }
             >
-              {runtimeStatus.admin_state}
+              {restartPending
+                ? "disabled · restart pending"
+                : runtimeStatus.admin_state}
             </span>
           )}
           {runtimeStatus.admin_state != null && (

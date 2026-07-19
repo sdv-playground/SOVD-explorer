@@ -739,6 +739,12 @@ pub struct ActivationInfo {
 /// only on components that support administrative disable, absent otherwise —
 /// absent means "render no admin surface at all"). All optional: the vendor
 /// block may be absent on a spec-pure entity.
+///
+/// `reboot_pending` rides next to `admin_state`: true only while the
+/// component is administratively disabled but its application is still
+/// running (RT after an erase — the M7 executes from SRAM until the node
+/// reboots). Device-derived, absent on the wire otherwise, and it self-clears
+/// after the real node reboot — so absent maps to `false`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub ready: Option<bool>,
@@ -746,6 +752,8 @@ pub struct RuntimeStatus {
     pub hb_seq: Option<u32>,
     pub boot_count: Option<u64>,
     pub admin_state: Option<String>,
+    #[serde(default)]
+    pub reboot_pending: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1195,7 +1203,8 @@ async fn flash_get_activation(state: State<'_, AppState>) -> Result<ActivationIn
 /// through the connected `SovdClient`, not the flash client. Maps the standard
 /// `EntityStatus` onto `ready`, and surfaces the vendor `x-sumo-runtime`
 /// passthrough (`boot_id` lifetime nonce, `hb_seq` heartbeat, `boot_count` NV
-/// reset counter). Vendor fields are best-effort — absent ones stay `None`.
+/// reset counter). Vendor fields are best-effort — absent ones stay `None`
+/// (`reboot_pending` is absent-means-false).
 #[tauri::command]
 async fn read_status(
     state: State<'_, AppState>,
@@ -1222,6 +1231,10 @@ async fn read_status(
             .and_then(|r| r.get("admin_state"))
             .and_then(|v| v.as_str())
             .map(String::from),
+        reboot_pending: runtime
+            .and_then(|r| r.get("reboot_pending"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 

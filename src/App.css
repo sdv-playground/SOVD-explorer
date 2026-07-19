@@ -976,6 +976,15 @@ select option {
   border-color: rgba(251, 191, 36, 0.4);
 }
 
+/* Disabled with reboot_pending: the erase is armed but the application still
+   runs until the node reboots. Same amber (still "intentionally stopped"),
+   tightened — dashed, stronger border — to read as not-yet-settled. */
+.admin-badge.disabled.restart-pending {
+  background: rgba(251, 191, 36, 0.18);
+  border-color: rgba(251, 191, 36, 0.7);
+  border-style: dashed;
+}
+
 .admin-toggle-btn {
   padding: 0.15rem 0.75rem;
   border: 1px solid #0f3460;
