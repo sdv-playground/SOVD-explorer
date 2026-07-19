@@ -951,6 +951,57 @@ select option {
   border-color: rgba(248, 113, 113, 0.4);
 }
 
+/* Administrative state (x-sumo-runtime.admin_state). Tri-state contract:
+   the field is absent on components that cannot be disabled, so neither the
+   badge nor the toggle renders there. "disabled" is amber, deliberately not
+   red — the component is intentionally stopped, not unhealthy. */
+.admin-badge {
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-family: monospace;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.admin-badge.enabled {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.12);
+  border-color: rgba(148, 163, 184, 0.4);
+}
+
+.admin-badge.disabled {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.4);
+}
+
+.admin-toggle-btn {
+  padding: 0.15rem 0.75rem;
+  border: 1px solid #0f3460;
+  border-radius: 999px;
+  background: #16213e;
+  color: #e2e8f0;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.admin-toggle-btn:hover:not(:disabled) {
+  border-color: #e94560;
+}
+
+.admin-toggle-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.admin-confirm-text {
+  color: #94a3b8;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
 .runtime-field {
   display: inline-flex;
   align-items: baseline;

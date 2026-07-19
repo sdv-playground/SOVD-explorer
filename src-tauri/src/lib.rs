@@ -734,14 +734,18 @@ pub struct ActivationInfo {
 /// `ready` is the standard `EntityStatus` (`Ready` → `true`); the rest are the
 /// vendor `x-sumo-runtime` passthrough: `boot_id` (per-guest-lifetime nonce —
 /// the canonical "has-rebooted" signal), `hb_seq` (heartbeat liveness,
-/// advances ~1/s) and `boot_count` (NV reset counter). All optional: the
-/// vendor block may be absent on a spec-pure entity.
+/// advances ~1/s), `boot_count` (NV reset counter) and `admin_state`
+/// (administrative read-back, tri-state contract: `"enabled"`/`"disabled"`
+/// only on components that support administrative disable, absent otherwise —
+/// absent means "render no admin surface at all"). All optional: the vendor
+/// block may be absent on a spec-pure entity.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub ready: Option<bool>,
     pub boot_id: Option<u32>,
     pub hb_seq: Option<u32>,
     pub boot_count: Option<u64>,
+    pub admin_state: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1214,6 +1218,107 @@ async fn read_status(
         boot_id: field("boot_id").map(|n| n as u32),
         hb_seq: field("hb_seq").map(|n| n as u32),
         boot_count: field("boot_count"),
+        admin_state: runtime
+            .and_then(|r| r.get("admin_state"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
+}
+
+// =============================================================================
+// Administrative State (per-component disable/enable)
+// =============================================================================
+
+/// Outcome of the `x-sumo-admin-state` op — the §7.14 execution flattened for
+/// the frontend. `status == "failed"` means the state change persisted but
+/// enacting it did not complete (flag-first ordering on the device); `error`
+/// carries the reason. `reboot_required` is true when a node restart is still
+/// needed to complete the change (RT disable arms, the tester resets).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminStateResult {
+    pub status: String,
+    pub state: Option<String>,
+    pub reboot_required: bool,
+    pub error: Option<String>,
+}
+
+/// `POST /vehicle/v1/components/{id}/operations/x-sumo-admin-state/executions`
+/// — the per-component administrative disable/enable vendor op. Body
+/// `{"state": "enabled" | "disabled", "reason"?}` → synchronous ISO 17978-3
+/// §7.14 `OperationExecution` whose `result` carries
+/// `{state, reboot_required}`.
+///
+/// Rides the connected `SovdClient`'s HTTP client, so the request reuses the
+/// signed-in operator's bearer (verb `component-admin`) and the connection's
+/// TLS trust terms. Failure modes map onto operator guidance: 401/403 →
+/// sign in with a workshop account; 409 → the server's not-idle message;
+/// 400 → the component does not support administrative disable.
+#[tauri::command]
+async fn set_admin_state(
+    state: State<'_, AppState>,
+    component_id: String,
+    admin_state: String,
+    reason: Option<String>,
+) -> Result<AdminStateResult, String> {
+    let client = get_client(&state)?;
+
+    let url = client
+        .base_url()
+        .join(&format!(
+            "/vehicle/v1/components/{}/operations/x-sumo-admin-state/executions",
+            component_id
+        ))
+        .map_err(|e| format!("Invalid admin-state URL: {}", e))?;
+
+    let mut body = serde_json::json!({ "state": admin_state });
+    if let Some(r) = reason.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        body["reason"] = serde_json::Value::String(r.to_string());
+    }
+
+    let response = client
+        .http_client()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Admin state request failed: {}", e))?;
+
+    let http_status = response.status();
+    if !http_status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail.trim().to_string();
+        return Err(match http_status.as_u16() {
+            401 => "Not signed in — sign in with a workshop account to change component state."
+                .to_string(),
+            403 => "Not authorized — the signed-in account cannot change component state. \
+                    Sign in with a workshop account."
+                .to_string(),
+            409 if !detail.is_empty() => detail,
+            409 => "Component is not idle — resolve the in-flight update or session, then retry."
+                .to_string(),
+            400 if !detail.is_empty() => detail,
+            400 => "This component does not support administrative disable.".to_string(),
+            _ => format!("Admin state change failed ({}): {}", http_status, detail),
+        });
+    }
+
+    let exec: OperationExecution = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse admin state response: {}", e))?;
+
+    let result = exec.result.unwrap_or(serde_json::Value::Null);
+    Ok(AdminStateResult {
+        status: exec.status.to_string(),
+        state: result
+            .get("state")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        reboot_required: result
+            .get("reboot_required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        error: exec.error,
     })
 }
 
@@ -1505,6 +1610,8 @@ pub fn run() {
             flash_rollback,
             flash_get_activation,
             read_status,
+            // Administrative state (per-component disable/enable)
+            set_admin_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

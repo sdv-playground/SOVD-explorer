@@ -2150,13 +2150,28 @@ interface ActivationInfo {
 
 // Converged SOVD /status read (ISO 17978-3 §7.19.2). `ready` is the standard
 // EntityStatus; boot_id (lifetime nonce — the canonical "has-rebooted" signal),
-// hb_seq (heartbeat liveness) and boot_count (NV reset counter) are the vendor
-// x-sumo-runtime passthrough.
+// hb_seq (heartbeat liveness), boot_count (NV reset counter) and admin_state
+// are the vendor x-sumo-runtime passthrough. admin_state is tri-state by
+// contract: "enabled"/"disabled" only on components that support
+// administrative disable, absent otherwise — absent means render no admin
+// badge and no toggle (never a dead control).
 interface RuntimeStatus {
   ready: boolean | null;
   boot_id: number | null;
   hb_seq: number | null;
   boot_count: number | null;
+  admin_state: string | null;
+}
+
+// Outcome of the x-sumo-admin-state op (§7.14 execution, flattened by the
+// backend command). status "failed" means the state change persisted but
+// enacting it did not complete; reboot_required means a node restart is still
+// needed to finish the change (RT disable).
+interface AdminStateResult {
+  status: string;
+  state: string | null;
+  reboot_required: boolean;
+  error: string | null;
 }
 
 interface CommitRollbackResult {
@@ -2193,6 +2208,10 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
   const [swVersionAfter, setSwVersionAfter] = useState<string | null>(null);
   const [activationState, setActivationState] = useState<ActivationInfo | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [adminConfirmOpen, setAdminConfirmOpen] = useState(false);
+  const [adminReason, setAdminReason] = useState("");
+  const [adminRebootRequired, setAdminRebootRequired] = useState(false);
 
   const addLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -2369,6 +2388,10 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     setCurrentSwVersion(null);
     setActivationState(null);
     setRuntimeStatus(null);
+    setAdminBusy(false);
+    setAdminConfirmOpen(false);
+    setAdminReason("");
+    setAdminRebootRequired(false);
     setLogs([]);
 
     // Hydrate from server state first; only check other transfers if idle
@@ -2380,10 +2403,63 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
     // Read current SW version on load
     readSwVersion().then(v => setCurrentSwVersion(v));
     // Read converged /status (guest health + x-sumo-runtime) on load
-    invoke<RuntimeStatus>("read_status", { componentId })
-      .then(setRuntimeStatus)
-      .catch(() => setRuntimeStatus(null));
+    refreshRuntimeStatus();
   }, [componentId]);
+
+  // Re-read the converged /status (guest health + x-sumo-runtime) so the
+  // health and admin badges reflect the device's current state.
+  const refreshRuntimeStatus = async () => {
+    try {
+      setRuntimeStatus(await invoke<RuntimeStatus>("read_status", { componentId }));
+    } catch {
+      setRuntimeStatus(null);
+    }
+  };
+
+  // Change the component's administrative state via the x-sumo-admin-state
+  // op. Rides the connected client, which carries the signed-in operator's
+  // bearer. Always refreshes /status afterwards so the badge flips to the
+  // device's persisted state.
+  const setAdminState = async (nextState: "enabled" | "disabled", reason?: string) => {
+    setAdminBusy(true);
+    setError(null);
+    try {
+      addLog(`${nextState === "disabled" ? "Disabling" : "Enabling"} ${componentId}...`);
+      const result = await invoke<AdminStateResult>("set_admin_state", {
+        componentId,
+        adminState: nextState,
+        reason: reason?.trim() ? reason.trim() : null,
+      });
+      if (result.status === "completed") {
+        addLog(`Component ${componentId} is now ${result.state ?? nextState}.`);
+        if (nextState === "enabled") {
+          setAdminRebootRequired(false);
+        }
+      } else {
+        // The state change persisted, but enacting it did not complete —
+        // report honestly; the badge below shows the persisted state.
+        const message = result.error || "State change saved but could not be fully applied.";
+        setError(message);
+        addLog(`ERROR: ${message}`);
+      }
+      if (result.reboot_required) {
+        setAdminRebootRequired(true);
+        addLog("A node restart is required to complete the change.");
+      }
+      await refreshRuntimeStatus();
+    } catch (e) {
+      setError(String(e));
+      addLog(`ERROR: Admin state change failed: ${e}`);
+    } finally {
+      setAdminBusy(false);
+    }
+  };
+
+  const handleDisableConfirmed = async () => {
+    setAdminConfirmOpen(false);
+    await setAdminState("disabled", adminReason);
+    setAdminReason("");
+  };
 
   // Read software version from ECU (parameter reads route through gateway)
   const readSwVersion = async (): Promise<string | null> => {
@@ -2900,6 +2976,36 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
           <span className={`health-badge ${runtimeStatus.ready ? "ready" : "not-ready"}`}>
             {runtimeStatus.ready ? "ready" : "notReady"}
           </span>
+          {/* Admin surface renders ONLY when the device reports admin_state
+              (tri-state contract — never a dead badge or toggle). "disabled"
+              is amber, not red: intentionally stopped, not unhealthy. */}
+          {runtimeStatus.admin_state != null && (
+            <span
+              className={`admin-badge ${runtimeStatus.admin_state}`}
+              title="Administrative state"
+            >
+              {runtimeStatus.admin_state}
+            </span>
+          )}
+          {runtimeStatus.admin_state != null && (
+            <button
+              className="admin-toggle-btn"
+              disabled={adminBusy}
+              onClick={() => {
+                if (runtimeStatus.admin_state === "disabled") {
+                  setAdminState("enabled");
+                } else {
+                  setAdminConfirmOpen(true);
+                }
+              }}
+            >
+              {adminBusy
+                ? "Working..."
+                : runtimeStatus.admin_state === "disabled"
+                ? "Enable"
+                : "Disable"}
+            </button>
+          )}
           {runtimeStatus.boot_id != null && (
             <span className="runtime-field">
               <span className="runtime-label">lifetime</span>
@@ -2918,6 +3024,57 @@ function SoftwareTab({ componentId, gatewayComponentId, modeTarget, apiComponent
               <span className="runtime-value">{runtimeStatus.boot_count}</span>
             </span>
           )}
+        </div>
+      )}
+
+      {/* Disable confirmation (settings-modal pattern, with optional reason) */}
+      {adminConfirmOpen && (
+        <div className="settings-overlay" onClick={() => setAdminConfirmOpen(false)}>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="settings-modal-header">
+              <h2>Disable {componentId}?</h2>
+              <button className="settings-close" onClick={() => setAdminConfirmOpen(false)}>×</button>
+            </div>
+            <div className="settings-modal-body">
+              <div className="admin-confirm-text">
+                The component will be stopped and stays disabled — across restarts
+                and updates — until it is enabled again.
+              </div>
+              <div className="settings-group">
+                <label className="settings-label">Reason (optional)</label>
+                <input
+                  type="text"
+                  className="server-input"
+                  value={adminReason}
+                  onChange={(e) => setAdminReason(e.target.value)}
+                  placeholder="Why this component is being disabled"
+                />
+              </div>
+              <div className="settings-row" style={{ justifyContent: "flex-end" }}>
+                <button
+                  className="connect-btn"
+                  style={{ background: "#0f3460" }}
+                  onClick={() => setAdminConfirmOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button className="connect-btn" onClick={handleDisableConfirmed}>
+                  Disable
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Node restart still needed to complete an admin state change */}
+      {adminRebootRequired && (
+        <div className="awaiting-reset-info">
+          <div className="awaiting-reset-header">Node Restart Required</div>
+          <div className="awaiting-reset-hint">
+            The component is disabled, but a node restart is required to complete
+            the change. Restart the node promptly to finish it.
+          </div>
         </div>
       )}
 
